@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
 <meta name="theme-color" content="#0d3a67"/>
 <meta name="description" content="ДолгНавигатор — независимая предварительная проверка рисков перед списанием долгов и подготовкой документов в суд."/>
-<title>ДолгНавигатор — публичная beta</title>
+<title>ДолгНавигатор — Telegram Mini App beta</title>
 <style>
 :root{
   --bg:#f5f6fa; --card:#fff; --text:#182033; --muted:#687286; --line:#e5e8ef;
@@ -429,7 +429,171 @@ button,input{font:inherit}
   .result-actions{grid-template-columns:1fr}
 }
 
+
+.tg-context{
+  display:none;
+  align-items:center;
+  gap:7px;
+  margin-top:7px;
+  font-size:9px;
+  color:var(--muted)
+}
+.tg-context.show{display:flex}
+.tg-dot{
+  width:7px;height:7px;border-radius:999px;background:#2fa34a;flex:0 0 auto
+}
+.tg-user{
+  font-weight:700;color:var(--text)
+}
+html.tg-app body{
+  background:var(--tg-bg, var(--bg));
+}
+html.tg-app .app{
+  background:var(--tg-bg, var(--bg));
+}
+html.tg-dark{
+  --bg:#111820;
+  --card:#18222d;
+  --text:#f1f5f9;
+  --muted:#98a6b4;
+  --line:#293745;
+  --accentSoft:#192a3b;
+  --greenSoft:#183424;
+  --shadow:0 12px 32px rgba(0,0,0,.18);
+}
+html.tg-dark .top{
+  background:rgba(17,24,32,.95);
+}
+html.tg-dark .trust15-pill,
+html.tg-dark .process15,
+html.tg-dark .cta15,
+html.tg-dark .tile15,
+html.tg-dark .summary,
+html.tg-dark .result-card,
+html.tg-dark .qcard,
+html.tg-dark .explain,
+html.tg-dark .upload,
+html.tg-dark .beta-note{
+  background:var(--card);
+}
+html.tg-dark .step15,
+html.tg-dark .why15-item,
+html.tg-dark .legal-note,
+html.tg-dark .privacy-row{
+  background:#151f29;
+}
+
 </style>
+<script src="https://telegram.org/js/telegram-web-app.js?63">
+// ---------- Telegram Mini App shell ----------
+let tgApp = null;
+
+function isTelegramMiniApp(){
+  return !!(window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData);
+}
+
+function applyTelegramTheme(){
+  if(!window.Telegram || !window.Telegram.WebApp) return;
+  const tg = window.Telegram.WebApp;
+  const root = document.documentElement;
+  const p = tg.themeParams || {};
+
+  root.classList.add('tg-app');
+  root.classList.toggle('tg-dark', tg.colorScheme === 'dark');
+
+  if(p.bg_color) root.style.setProperty('--tg-bg', p.bg_color);
+  if(p.text_color) root.style.setProperty('--text', p.text_color);
+  if(p.hint_color) root.style.setProperty('--muted', p.hint_color);
+  if(p.button_color) root.style.setProperty('--accent', p.button_color);
+
+  try{
+    if(p.bg_color) tg.setBackgroundColor(p.bg_color);
+    if(p.secondary_bg_color) tg.setHeaderColor(p.secondary_bg_color);
+  }catch(e){}
+}
+
+function updateTelegramBackButton(screenId){
+  if(!tgApp || !tgApp.BackButton) return;
+  try{
+    if(screenId && screenId !== 'home') tgApp.BackButton.show();
+    else tgApp.BackButton.hide();
+  }catch(e){}
+}
+
+function telegramHaptic(type='light'){
+  if(!tgApp || !tgApp.HapticFeedback) return;
+  try{
+    tgApp.HapticFeedback.impactOccurred(type);
+  }catch(e){}
+}
+
+function initTelegramMiniApp(){
+  if(!window.Telegram || !window.Telegram.WebApp) return;
+
+  tgApp = window.Telegram.WebApp;
+  try{
+    tgApp.ready();
+    tgApp.expand();
+  }catch(e){}
+
+  applyTelegramTheme();
+
+  const ctx = document.getElementById('tgContext');
+  const ctxText = document.getElementById('tgContextText');
+  const user = tgApp.initDataUnsafe?.user;
+
+  if(ctx){
+    ctx.classList.add('show');
+    if(ctxText && user?.first_name){
+      ctxText.innerHTML = `Telegram · <span class="tg-user">${escapeHtml(user.first_name)}</span>`;
+    }
+  }
+
+  try{
+    tgApp.onEvent('themeChanged', applyTelegramTheme);
+  }catch(e){}
+
+  try{
+    tgApp.BackButton.onClick(()=>{
+      const active = document.querySelector('.screen.active')?.id;
+      if(active === 'question' && qi > 0){
+        prevQ();
+      }else if(active === 'upload'){
+        showScreen('result');
+      }else{
+        goHome();
+      }
+      telegramHaptic('light');
+    });
+  }catch(e){}
+
+  updateTelegramBackButton(document.querySelector('.screen.active')?.id || 'home');
+}
+
+// Escape Telegram first_name before putting it into HTML.
+function escapeHtml(value){
+  return String(value).replace(/[&<>"']/g, ch=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'
+  })[ch]);
+}
+
+// Hook screen switching into Telegram native Back button.
+const _tgOldShowScreen = showScreen;
+showScreen = function(id){
+  _tgOldShowScreen(id);
+  updateTelegramBackButton(id);
+};
+
+// Light haptic feedback on major interactions.
+document.addEventListener('click', (ev)=>{
+  if(ev.target.closest('button,.tile15,.opt')){
+    telegramHaptic('light');
+  }
+}, {passive:true});
+
+document.addEventListener('DOMContentLoaded', initTelegramMiniApp);
+
+</script>
 </head>
 <body>
 <div class="app">
@@ -445,6 +609,10 @@ button,input{font:inherit}
         <span class="brandtag">Независимо</span>
       </div>
       <small>Ваш независимый долговой консультант</small>
+        <div class="tg-context" id="tgContext">
+          <span class="tg-dot"></span>
+          <span id="tgContextText">Открыто в Telegram</span>
+        </div>
     </div>
   </div>
   <div class="progress"><div id="progressBar"></div></div>
@@ -486,7 +654,7 @@ button,input{font:inherit}
     </div>
 
     <div class="beta-note">
-      <b>Публичная beta.</b> Сейчас сервис делает предварительную проверку по вашим ответам. Данные сохраняются только в браузере на этом устройстве. Загрузка и автоматический разбор документов появятся на следующем этапе.
+      <b>Публичная beta.</b> Версия работает и как обычный сайт, и как Telegram Mini App. Сейчас сервис делает предварительную проверку по вашим ответам. Данные сохраняются только в браузере на этом устройстве. Загрузка и автоматический разбор документов появятся на следующем этапе.
     </div>
 
     <div class="process15">
