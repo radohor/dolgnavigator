@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v10.7 hybrid: договоры внутри одного БКИ не склеиваются. Между БКИ применяется взаимно-однозначное сопоставление: UID/ID, затем кредитор+дата с проверкой суммы/просрочки. Неоднозначные пары не объединяются.</div>
+<div class="analyzer-note">v10.8 hybrid: автоматическое объединение между БКИ допускается только по UID/ID либо по сильному совпадению кредитора, даты и дополнительного признака (сумма или первая просрочка). Совпадение только по кредитору и дате не склеивается.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1208,6 +1208,14 @@ function creditIsStructuralName(s){
   return false;
 }
 function creditNormBank(s){
+  // v10.8: убираем служебные префиксы Скоринг Бюро из названия кредитора.
+  s=String(s||'')
+    .replace(/ИСТОЧНИК\s+ИНФОРМАЦИИ\s*:\s*/gi,'')
+    .replace(/^(?:БАНК|МФО)\s+(?:БАНК|МФО)\s*:\s*/i,'')
+    .replace(/^(?:БАНК|МФО)\s*:\s*/i,'')
+    .replace(/\s+/g,' ')
+    .trim();
+
   let x=String(s||'').replace(/\u00ad/g,'').replace(/\s+/g,' ').trim();
   if(creditIsStructuralName(x)) return 'Банк не определён';
   x=x.toUpperCase()
@@ -1793,10 +1801,20 @@ function creditDedupLoans(docs){
           reverseBest.m.score>=best.m.score &&
           reverseSameTop.length>0;
 
-        // Exact creditor + exact date is acceptable even with missing amount,
-        // but only when there is no competing same-score candidate.
-        const exactDate=best.m.reasons.includes('точная дата');
-        const acceptableScore=best.m.score>=65 || (exactDate && best.m.score>=50);
+        // v10.8: одного совпадения кредитора и даты недостаточно.
+        // Для автоматической склейки нужен дополнительный подтверждающий признак:
+        // совпавшая/близкая сумма либо совпавшая дата первой просрочки.
+        const hasAmountEvidence=
+          best.m.reasons.includes('точная сумма') ||
+          best.m.reasons.includes('сумма близка');
+
+        const hasOverdueEvidence=
+          best.m.reasons.includes('точная дата первой просрочки') ||
+          best.m.reasons.includes('первая просрочка ±1 день');
+
+        const acceptableScore=
+          best.m.score>=65 &&
+          (hasAmountEvidence || hasOverdueEvidence);
 
         if(currentUnique && !reverseAmbiguous && acceptableScore){
           existing=best.g;
@@ -1820,7 +1838,7 @@ function creditDedupLoans(docs){
         reasons:selectedMeta.reasons,
         reliability:selectedMeta.score>=120?'высокая':
                     selectedMeta.score>=80?'высокая':
-                    selectedMeta.score>=65?'средняя':'требует проверки'
+                    selectedMeta.score>=65?'средняя':'не объединять'
       });
 
       for(const f of [
@@ -2130,7 +2148,7 @@ function creditRenderResult(docs){
 
     <div class="merge-card">
       <h3>После объединения БКИ</h3>
-      <p>Локальный парсер исключает служебные заголовки. Нераспознанные блоки Скоринг Бюро при необходимости проверяются AI. Договоры объединяются по УИД/ID, а затем по похожему названию кредитора, дате и сумме.</p>
+      <p>Локальный парсер исключает служебные заголовки. Нераспознанные блоки Скоринг Бюро при необходимости проверяются AI. Договоры объединяются по УИД/ID либо по сильному совпадению: кредитор + дата + дополнительный подтверждающий признак (сумма или дата первой просрочки). Совпадение только по кредитору и дате не считается подтверждением.</p>
       <div class="merge-pills">
         <span class="merge-pill">Уникальных договоров: ${loans.length}</span>
         <span class="merge-pill">Подтверждены 2+ БКИ: ${confirmed2}</span>
