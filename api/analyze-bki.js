@@ -61,7 +61,7 @@ export default async function handler(req, res) {
 Локальный результат и сигналы:
 ${JSON.stringify(meta).slice(0,8000)}
 
-Сравни local с signals. Если structural marker count заметно больше числа локально извлечённых записей, это parser_anomaly даже если отдельный показанный фрагмент выглядит корректно. Не называй результат ok при таком числовом расхождении.
+Сравни local с signals. Если signals содержит ненулевой structural marker count, считай его надёжным denominator только для этого раздела. Если marker count заметно больше числа локально извлечённых записей, это parser_anomaly. Если marker count равен 0, не делай вывод о полноте этого раздела по marker count. Не называй результат ok при таком числовом расхождении.
 Не делай вывод по невидимой части файла.
 Верни ТОЛЬКО JSON:
 {
