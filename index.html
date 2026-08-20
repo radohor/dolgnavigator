@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v10.6 hybrid: договоры внутри одного БКИ не склеиваются. Между БКИ каждому объединению присваивается причина и надёжность; неоднозначные совпадения не объединяются автоматически. AI-fallback применяется только для неполных блоков.</div>
+<div class="analyzer-note">v10.7 hybrid: договоры внутри одного БКИ не склеиваются. Между БКИ применяется взаимно-однозначное сопоставление: UID/ID, затем кредитор+дата с проверкой суммы/просрочки. Неоднозначные пары не объединяются.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1674,31 +1674,33 @@ function creditDedupLoans(docs){
   );
 
   const quality=x=>
-    (x.uid?10:0)+
-    (x.contract?5:0)+
-    (x.amountNum?3:0)+
-    (x.overdueDate?3:0)+
-    (x.paidTotal?2:0);
+    (x.uid?10:0)+(x.contract?5:0)+(x.amountNum?3:0)+
+    (x.overdueDate?3:0)+(x.paidTotal?2:0);
 
   all.sort((a,b)=>quality(b)-quality(a));
   const groups=[];
 
-  const amountCompatible=(a,b)=>{
+  const amountState=(a,b)=>{
     if(a && b){
       const diff=Math.abs(a-b);
-      return diff<=Math.max(1500,Math.min(a,b)*0.015);
+      if(diff<=1) return {ok:true,score:30,label:'точная сумма'};
+      if(diff<=Math.max(1500,Math.min(a,b)*0.015))
+        return {ok:true,score:15,label:'сумма близка'};
+      return {ok:false,score:0,label:'суммы различаются'};
     }
-    return true;
+    return {ok:true,score:0,label:'сумма отсутствует в одном БКИ'};
   };
 
-  const overdueCompatible=(a,b)=>{
-    if(!a || !b) return true;
-    return creditAbsDays(a,b)<=1;
+  const overdueState=(a,b)=>{
+    if(!a || !b) return {ok:true,score:0,label:null};
+    const d=creditAbsDays(a,b);
+    if(d===0) return {ok:true,score:15,label:'точная дата первой просрочки'};
+    if(d===1) return {ok:true,score:7,label:'первая просрочка ±1 день'};
+    return {ok:false,score:0,label:'разные даты первой просрочки'};
   };
 
-  const matchScore=(c,g)=>{
-    let score=0;
-    const reasons=[];
+  const scorePair=(c,g)=>{
+    if(!creditBankSimilar(c.bank,g.bank)) return null;
 
     const cuid=String(c.uid||'').trim();
     const guid=String(g.uid||'').trim();
@@ -1706,94 +1708,106 @@ function creditDedupLoans(docs){
     const gid=String(g.contract||'').trim();
 
     if(cuid && guid && cuid===guid){
-      score+=100;
-      reasons.push('UID');
+      return {score:140,reasons:['UID'],tier:'high'};
     }
 
-    if(cid && gid && cid===gid && creditBankSimilar(c.bank,g.bank)){
-      score+=80;
-      reasons.push('ID договора');
-    }
-
-    if(creditBankSimilar(c.bank,g.bank)){
-      score+=20;
-      reasons.push('кредитор');
+    if(cid && gid && cid===gid){
+      return {score:120,reasons:['ID договора','кредитор'],tier:'high'};
     }
 
     const dayDiff=creditAbsDays(c.date,g.date);
+    if(dayDiff>1) return null;
+
+    let score=20;
+    const reasons=['кредитор'];
+
     if(dayDiff===0){
-      score+=25;
+      score+=30;
       reasons.push('точная дата');
-    }else if(dayDiff===1){
-      score+=10;
+    }else{
+      score+=12;
       reasons.push('дата ±1 день');
-    }else{
-      return null;
     }
 
-    if(c.amountNum && g.amountNum){
-      const diff=Math.abs(c.amountNum-g.amountNum);
-      if(diff<=1){
-        score+=30;
-        reasons.push('точная сумма');
-      }else if(amountCompatible(c.amountNum,g.amountNum)){
-        score+=15;
-        reasons.push('сумма близка');
-      }else{
-        return null;
-      }
-    }else{
-      reasons.push('сумма отсутствует в одном БКИ');
-    }
+    const a=amountState(c.amountNum,g.amountNum);
+    if(!a.ok) return null;
+    score+=a.score;
+    reasons.push(a.label);
 
-    if(c.overdueDate && g.overdueDate){
-      if(creditAbsDays(c.overdueDate,g.overdueDate)===0){
-        score+=15;
-        reasons.push('точная дата первой просрочки');
-      }else if(overdueCompatible(c.overdueDate,g.overdueDate)){
-        score+=7;
-        reasons.push('первая просрочка ±1 день');
-      }else{
-        return null;
-      }
-    }
+    const o=overdueState(c.overdueDate,g.overdueDate);
+    if(!o.ok) return null;
+    score+=o.score;
+    if(o.label) reasons.push(o.label);
 
-    return {score,reasons};
+    return {score,reasons,tier:score>=80?'high':score>=50?'medium':'low'};
+  };
+
+  // Возвращает кандидатов для записи среди групп другого БКИ.
+  const candidatesFor=(c,pool)=>{
+    return pool
+      .filter(g=>!(g.sources||[]).includes(c.bureau))
+      .map(g=>({g,m:scorePair(c,g)}))
+      .filter(x=>x.m)
+      .sort((a,b)=>b.m.score-a.m.score);
   };
 
   for(const c of all){
     const bank=creditNormBank(c.bank||c.source);
-    const crossBkiGroups=groups.filter(g=>
-      !(g.sources||[]).includes(c.bureau)
-    );
-
-    const scored=crossBkiGroups
-      .map(g=>({g,m:matchScore(c,g)}))
-      .filter(x=>x.m)
-      .sort((a,b)=>b.m.score-a.m.score);
+    const pool=groups.filter(g=>!(g.sources||[]).includes(c.bureau));
+    const scored=candidatesFor(c,pool);
 
     let existing=null;
     let selectedMeta=null;
 
     if(scored.length){
       const best=scored[0];
-      const second=scored[1];
 
-      // Автоматическая склейка только когда совпадение достаточно сильное
-      // и нет близкого конкурирующего кандидата.
-      const clearMargin=!second || (best.m.score-second.m.score)>=15;
-      const strong=best.m.score>=60;
-
-      if(strong && clearMargin){
+      // Надёжный UID/ID объединяем сразу.
+      if(best.m.score>=120){
         existing=best.g;
         selectedMeta=best.m;
+      } else {
+        // Для мягкого совпадения требуем взаимную однозначность:
+        // у текущей записи один лучший кандидат, и у этого кандидата
+        // текущая запись также является единственным лучшим кандидатом.
+        const sameTop=scored.filter(x=>x.m.score===best.m.score);
+        const currentUnique=sameTop.length===1;
+
+        const reversePool=all.filter(x=>
+          x.bureau!==best.g.bureau &&
+          x.bureau===c.bureau &&
+          x._rowIndex!==c._rowIndex
+        );
+
+        const reverseScored=reversePool
+          .map(x=>({x,m:scorePair(x,best.g)}))
+          .filter(x=>x.m)
+          .sort((a,b)=>b.m.score-a.m.score);
+
+        const reverseBest=reverseScored[0];
+        const reverseSameTop=reverseBest
+          ? reverseScored.filter(x=>x.m.score===reverseBest.m.score)
+          : [];
+
+        const reverseAmbiguous=reverseBest &&
+          reverseBest.m.score>=best.m.score &&
+          reverseSameTop.length>0;
+
+        // Exact creditor + exact date is acceptable even with missing amount,
+        // but only when there is no competing same-score candidate.
+        const exactDate=best.m.reasons.includes('точная дата');
+        const acceptableScore=best.m.score>=65 || (exactDate && best.m.score>=50);
+
+        if(currentUnique && !reverseAmbiguous && acceptableScore){
+          existing=best.g;
+          selectedMeta=best.m;
+        }
       }
     }
 
     if(existing){
       existing.sources=[...new Set([...(existing.sources||[]),c.bureau])];
       existing.sourceCount=existing.sources.length;
-
       existing.crossBkiMatches=existing.crossBkiMatches||[];
       existing.crossBkiMatches.push({
         bureau:c.bureau,
@@ -1804,7 +1818,9 @@ function creditDedupLoans(docs){
         contract:c.contract||'',
         score:selectedMeta.score,
         reasons:selectedMeta.reasons,
-        reliability:selectedMeta.score>=100?'высокая':selectedMeta.score>=75?'средняя':'требует проверки'
+        reliability:selectedMeta.score>=120?'высокая':
+                    selectedMeta.score>=80?'высокая':
+                    selectedMeta.score>=65?'средняя':'требует проверки'
       });
 
       for(const f of [
@@ -2022,6 +2038,7 @@ function creditRenderResult(docs){
   const desc=crisisDescribe(crisis);
 
 
+  // v10.7: аудит только реально объединённых пар; неоднозначные кандидаты не склеиваются.
   const mergeAudit=loans
     .filter(l=>(l.sources||[]).length>=2)
     .map(l=>{
