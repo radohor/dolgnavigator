@@ -38,24 +38,37 @@ def _clean_join(parts) -> str:
         parts = [parts]
     return " ".join(str(x).strip() for x in parts if str(x).strip())
 
-_PRODUCT_MARKERS = (
-    "НЕОБЕСПЕЧЕНН", "ОБЕСПЕЧЕНН", "МИКРОЗА", "ПОТРЕБИТЕЛ",
-    "КРЕДИТНАЯ КАРТА", "КРЕДИТНЫЙ ЛИМИТ", "АВТОКРЕДИТ", "ИПОТЕ", "ЗАЕМ", "ЗАЙМ", "КРЕДИТ"
+_PRODUCT_PREFIXES = (
+    "НЕОБЕСПЕЧЕННЫЙ", "ОБЕСПЕЧЕННЫЙ", "МИКРОЗАЕМ", "МИКРОЗАЙМ",
+    "ПОТРЕБИТЕЛЬСКИЙ КРЕДИТ", "КРЕДИТНАЯ КАРТА", "КРЕДИТНЫЙ ЛИМИТ",
+    "АВТОКРЕДИТ", "ИПОТЕКА", "ЗАЕМ (КРЕДИТ)", "ЗАЙМ (КРЕДИТ)"
 )
 
+def _is_product_fragment(piece: str) -> bool:
+    up = piece.upper().strip()
+    return any(up.startswith(prefix) for prefix in _PRODUCT_PREFIXES)
+
 def _scoring_creditor(parts) -> str:
+    """
+    creditor_type_raw begins with one or several fragments of the creditor's
+    legal name and only then contains product/type fragments.
+    Stop only on known PRODUCT prefixes. Words such as
+    "МИКРОКРЕДИТНАЯ КОМПАНИЯ" are part of a legal name and must be retained.
+    """
     if not parts:
         return ""
     if isinstance(parts, str):
         parts = [parts]
+
     kept = []
     for raw in parts:
         piece = str(raw).strip()
         if not piece:
             continue
-        if kept and any(marker in piece.upper() for marker in _PRODUCT_MARKERS):
+        if kept and _is_product_fragment(piece):
             break
         kept.append(piece)
+
     return _clean_join(kept or parts[:1])
 
 def _application_status(status_raw):
