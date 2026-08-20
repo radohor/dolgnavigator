@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v10.3 hybrid: договоры внутри каждого БКИ сохраняются отдельно по УИД/ID, а мягкое сопоставление применяется только между разными БКИ. AI-fallback используется только для неполных блоков и не додумывает отсутствующие данные.</div>
+<div class="analyzer-note">v10.4 hybrid: каждый блок «Договор №…» Скоринг Бюро сохраняется отдельно без внутренней склейки. Объединение выполняется только между разными БКИ. AI-fallback используется только для неполных блоков.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1356,7 +1356,9 @@ function creditParseScoringContracts(text){
       bureauType:'scoring-block-v10',rawBlock:block
     });
   }
-  return creditMergeContractRows(out);
+  // v10.4: НЕ дедуплицируем договорные блоки Скоринг Бюро внутри отчёта.
+  // Каждый «Договор №...» является самостоятельной записью БКИ.
+  return out;
 }
 
 async function creditAiAnalyzeBlock(block,bureau='Скоринг Бюро'){
@@ -1435,8 +1437,43 @@ async function creditApplyAiFallback(doc){
     try{ recovered.push(...await creditAiAnalyzeBlock(block,doc.bureau)); }
     catch(e){ error=e.message||String(e); break; }
   }
-  const contracts=creditMergeContractRows([...doc.contracts,...recovered]);
-  return {...doc,contracts,aiFallback:{used:true,checked:Math.min(unresolved.length,10),recovered:recovered.length,error}};
+  // AI добавляет только действительно новые записи и не склеивает исходные договоры Скоринг Бюро.
+  const contracts=[...doc.contracts];
+  let added=0;
+
+  for(const c of recovered){
+    const uid=String(c.uid||'').trim();
+    const contract=String(c.contract||'').trim();
+
+    const duplicate=contracts.some(x=>{
+      if(uid && x.uid && String(x.uid).trim()===uid) return true;
+      if(contract && x.contract &&
+         String(x.contract).trim()===contract &&
+         creditBankSimilar(c.bank,x.bank)) return true;
+
+      // Только для AI-восстановления допускаем строгий soft-match:
+      // тот же кредитор + та же дата + одинаковая известная сумма.
+      if(!uid && !contract &&
+         c.amountNum && x.amountNum &&
+         creditBankSimilar(c.bank,x.bank) &&
+         creditFmt(c.date)===creditFmt(x.date) &&
+         Math.abs(c.amountNum-x.amountNum)<=1) return true;
+
+      return false;
+    });
+
+    if(!duplicate){
+      contracts.push(c);
+      added++;
+    }
+  }
+
+  return {...doc,contracts,aiFallback:{
+    used:true,
+    checked:Math.min(unresolved.length,10),
+    recovered:added,
+    error
+  }};
 }
 function creditParseScoringApplications(text){
   const out=[];
