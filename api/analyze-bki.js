@@ -1,16 +1,19 @@
 export default async function handler(req, res) {
-  // CORS для браузера / Telegram Mini App
+  // Разрешаем запросы из браузера / Telegram Mini App
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Браузер перед POST может сначала отправить OPTIONS
+  // Предварительный CORS-запрос браузера
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
 
+  // Сам API должен принимать только POST
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
   }
 
   try {
@@ -36,23 +39,30 @@ export default async function handler(req, res) {
 Бюро: ${bureau || "не определено"}
 
 Задача:
+
 1. Найди только реальные кредитные договоры.
 2. Не считай заголовки страниц, номера разделов и служебный текст кредиторами.
-3. Отделяй заявки и отказы от фактически заключенных договоров.
-4. Для каждого договора извлеки:
-   - creditor
-   - contract_date
-   - amount
-   - currency
-   - contract_id
-   - uid
-   - status
-   - first_overdue_date
-   - paid_total
-5. Если поле отсутствует — верни null.
-6. Не выдумывай данные.
+3. Не путай заявку на кредит с фактически заключенным договором.
+4. Не путай отказ в выдаче кредита с договором.
+5. Если в одном фрагменте несколько договоров — верни каждый отдельно.
+6. Ничего не выдумывай.
+7. Если значение поля отсутствует в тексте — верни null.
 
-Верни только JSON такого вида:
+Для каждого договора извлеки:
+
+- creditor
+- contract_date
+- amount
+- currency
+- contract_id
+- uid
+- status
+- first_overdue_date
+- paid_total
+
+Верни ТОЛЬКО валидный JSON без пояснений и markdown.
+
+Формат:
 
 {
   "contracts": [
@@ -76,22 +86,25 @@ export default async function handler(req, res) {
 ${text.slice(0, 50000)}
 `;
 
-    const response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: "gpt-5.6-luna",
-        input: prompt
-      })
-    });
+    const response = await fetch(
+      "https://api.openai.com/v1/responses",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: "gpt-5.6-luna",
+          input: prompt
+        })
+      }
+    );
 
     const data = await response.json();
 
     if (!response.ok) {
-      console.error(data);
+      console.error("OpenAI API error:", data);
 
       return res.status(response.status).json({
         error: "OpenAI API error",
@@ -110,15 +123,25 @@ ${text.slice(0, 50000)}
     try {
       const cleaned = outputText
         .replace(/^```json\s*/i, "")
+        .replace(/^```\s*/i, "")
         .replace(/```$/i, "")
         .trim();
 
       parsed = JSON.parse(cleaned);
-    } catch {
+    } catch (error) {
+      console.error("Invalid AI JSON:", outputText);
+
       return res.status(502).json({
         error: "AI returned invalid JSON",
         raw: outputText
       });
+    }
+
+    if (!parsed || !Array.isArray(parsed.contracts)) {
+      parsed = {
+        contracts: [],
+        warnings: ["AI response did not contain contracts array"]
+      };
     }
 
     return res.status(200).json({
@@ -128,11 +151,11 @@ ${text.slice(0, 50000)}
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("Internal server error:", error);
 
     return res.status(500).json({
       error: "Internal server error",
-      message: error.message
+      message: error?.message || String(error)
     });
   }
 }
