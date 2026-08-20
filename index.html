@@ -1315,7 +1315,7 @@ function creditParseScoringContracts(text){
 }
 
 async function creditAiAnalyzeBlock(block,bureau='Скоринг Бюро'){
-  const response=await fetch('/api/analyze-bki',{
+  const respoconst response=await fetch('https://dolgnavigator.vercel.app/api/analyze-bki',{nse=await fetch('/api/analyze-bki',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({bureau,text:block.slice(0,48000)})
   });
