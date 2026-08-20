@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!-- ДолгНавигатор BKI v11: cross-BKI zero-day dedup fix + scoring soft merge -->
 <!-- ДолгНавигатор BKI Beta v10 Hybrid: deterministic parser + AI fallback -->
 
 <html lang="ru">
@@ -1248,6 +1249,7 @@ function creditBankSimilar(a,b){
 function creditMoneyNumber(s){if(s==null)return null;const n=parseFloat(String(s).replace(/\s/g,'').replace(',','.').replace(/[^\d.]/g,''));return Number.isFinite(n)?n:null}
 function creditMoneyFmt(n){if(n==null||!Number.isFinite(n)||n<=0)return 'сумма не определена';return new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0}).format(n)+' ₽'}
 function creditDaysBetween(a,b){if(!a||!b)return null;return Math.round((b-a)/86400000)}
+function creditAbsDays(a,b){const d=creditDaysBetween(a,b);return d==null?9999:Math.abs(d)}
 function creditMonthsBetween(a,b){const d=creditDaysBetween(a,b);return d==null?null:Math.max(0,Math.round(d/30.44))}
 function creditExtractBankBefore(text,index,windowSize=500){
   const part=text.slice(Math.max(0,index-windowSize),index);let found='';
@@ -1283,6 +1285,38 @@ function creditScoringUid(block){
   if(!m) return '';
   return ((m[1]||'')+(m[2]||'')).replace(/[^0-9a-fA-F-]/g,'').replace(/--+/g,'-');
 }
+function creditMergeContractRows(rows){
+  const quality=x=>(x.uid?10:0)+(x.contract?5:0)+(x.amountNum?3:0)+(x.overdueDate?3:0)+(x.paidTotal?2:0);
+  const ordered=[...rows].sort((a,b)=>quality(b)-quality(a));
+  const groups=[];
+
+  for(const c of ordered){
+    const bank=creditNormBank(c.bank||c.source);
+    if(!c.date || bank==='Банк не определён') continue;
+    const existing=groups.find(g=>{
+      if(c.uid && g.uid && c.uid===g.uid) return true;
+      if(c.contract && g.contract && c.contract===g.contract && creditBankSimilar(bank,g.bank)) return true;
+      if(creditAbsDays(g.date,c.date)>1 || !creditBankSimilar(bank,g.bank)) return false;
+      if(c.amountNum && g.amountNum){
+        const diff=Math.abs(c.amountNum-g.amountNum);
+        return diff<=Math.max(1000,Math.min(c.amountNum,g.amountNum)*0.02);
+      }
+      // If one BKI row has no amount, same creditor + same date is treated as one candidate contract.
+      return true;
+    });
+
+    if(existing){
+      for(const f of ['uid','contract','amountNum','amount','overdueDate','maxOverdueDays','paidTotal','actualEndDate','status','product','terminationBasis','rawBlock']){
+        if((existing[f]==null||existing[f]==='') && c[f]!=null && c[f]!=='') existing[f]=c[f];
+      }
+      existing.mergedRows=(existing.mergedRows||1)+1;
+    }else{
+      groups.push({...c,bank,mergedRows:1});
+    }
+  }
+  return groups;
+}
+
 function creditParseScoringContracts(text){
   const out=[];
   for(const block of creditScoringContractBlocks(text)){
@@ -1311,7 +1345,7 @@ function creditParseScoringContracts(text){
       bureauType:'scoring-block-v10',rawBlock:block
     });
   }
-  return creditUniq(out,x=>(x.uid?'uid|'+x.uid:(x.contract?'id|'+x.contract:'soft|'+creditNormBank(x.bank)+'|'+creditFmt(x.date)+'|'+Math.round(x.amountNum||0))));
+  return creditMergeContractRows(out);
 }
 
 async function creditAiAnalyzeBlock(block,bureau='Скоринг Бюро'){
@@ -1390,7 +1424,7 @@ async function creditApplyAiFallback(doc){
     try{ recovered.push(...await creditAiAnalyzeBlock(block,doc.bureau)); }
     catch(e){ error=e.message||String(e); break; }
   }
-  const contracts=creditUniq([...doc.contracts,...recovered],x=>(x.uid?'uid|'+x.uid:(x.contract?'id|'+x.contract:'soft|'+creditNormBank(x.bank)+'|'+creditFmt(x.date)+'|'+Math.round(x.amountNum||0))));
+  const contracts=creditMergeContractRows([...doc.contracts,...recovered]);
   return {...doc,contracts,aiFallback:{used:true,checked:Math.min(unresolved.length,10),recovered:recovered.length,error}};
 }
 function creditParseScoringApplications(text){
@@ -1593,12 +1627,14 @@ function creditDedupLoans(docs){
     const existing=groups.find(g=>{
       if(uid && g.uid && uid===g.uid) return true;
       if(c.contract && g.contract && c.contract===g.contract && creditBankSimilar(bank,g.bank)) return true;
-      const day=Math.abs(creditDaysBetween(g.date,c.date)||9999);
+      const day=creditAbsDays(g.date,c.date);
       if(day>2 || !creditBankSimilar(bank,g.bank)) return false;
       if(c.amountNum && g.amountNum){
         const diff=Math.abs(c.amountNum-g.amountNum);
         return diff<=Math.max(3000,Math.min(c.amountNum,g.amountNum)*0.025);
       }
+      // A missing amount in one bureau must not create a duplicate of the same creditor/date contract.
+      // This is especially common in Scoring Bureau vs OKB.
       return true;
     });
     if(existing){
@@ -1619,7 +1655,7 @@ function creditDedupApps(docs){
   for(const a of all){
     const amt=a.amountNum||creditMoneyNumber(a.amount);
     const existing=out.find(x=>{
-      const day=Math.abs(creditDaysBetween(x.date,a.date)||9999);
+      const day=creditAbsDays(x.date,a.date);
       if(day>1 || x.bank!==a.bank) return false;
       const xa=x.amountNum||creditMoneyNumber(x.amount);
       const amountMatch=!xa||!amt||Math.abs(xa-amt)<=Math.max(2000,Math.min(xa,amt)*0.03);
@@ -1632,8 +1668,8 @@ function creditDedupApps(docs){
 }
 
 function creditLoanContext(loan,loans,apps){
-  const nearbyLoans=loans.filter(x=>x!==loan&&Math.abs(creditDaysBetween(loan.date,x.date)||9999)<=7);
-  const nearbyApps=apps.filter(a=>Math.abs(creditDaysBetween(loan.date,a.date)||9999)<=7);
+  const nearbyLoans=loans.filter(x=>x!==loan&&creditAbsDays(loan.date,x.date)<=7);
+  const nearbyApps=apps.filter(a=>creditAbsDays(loan.date,a.date)<=7);
   const payMonths=loan.overdueDate?creditMonthsBetween(loan.date,loan.overdueDate):null;
 
   let level='info',label='Нужно уточнить',reason='По кредитной истории нельзя автоматически сделать вывод о несписании. Нужны анкета банка, доход и обстоятельства на дату кредита.';
@@ -1809,7 +1845,7 @@ function creditRenderResult(docs){
     const closed=dc.filter(c=>/закрыт|прекращ/i.test(c.status||'')).length;
     const rej=d.applications.filter(a=>/отказ/i.test(a.status||'')).length;
     const ai=d.aiFallback;
-    const aiLine=ai?`<div style="margin-top:8px;font-size:12px;color:#607077">AI-fallback: ${ai.used?('проверено '+ai.checked+', восстановлено '+ai.recovered+(ai.error?' · ошибка: '+escapeHtml(ai.error):'')):'не потребовался'}</div>`:'';
+    const aiLine=ai?`<div style="margin-top:8px;font-size:12px;color:#607077">AI-fallback: ${ai.used?('проверено '+ai.checked+', новых договоров '+ai.recovered+(ai.error?' · ошибка: '+escapeHtml(ai.error):'')):'не потребовался'}</div>`:'';
     return `<div class="source-card">
       <div class="source-head"><div><h4>${escapeHtml(d.bureau)}</h4><span>${d.numPages} стр. · ${escapeHtml(d.name)}</span></div></div>
       <div class="source-metrics">
