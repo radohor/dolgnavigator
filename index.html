@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v10.8 hybrid: автоматическое объединение между БКИ допускается только по UID/ID либо по сильному совпадению кредитора, даты и дополнительного признака (сумма или первая просрочка). Совпадение только по кредитору и дате не склеивается.</div>
+<div class="analyzer-note">v11 BKI rebuild: парсеры ОКБ и Скоринг Бюро перестроены по реальной структуре отчётов. Основное объединение договоров — по УИД; ID и банк+дата+сумма используются только как резервные признаки. Заявки и запросы Скоринг Бюро читаются из собственных таблиц.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1289,9 +1289,15 @@ function creditScoringSource(block){
   return creditNormBank(raw);
 }
 function creditScoringUid(block){
-  const m=block.match(/Уникальный идентификатор договора[\s\S]{0,80}?(?:\(УИД\))?\s*([0-9a-fA-F-]{12,})[\s\n\r]*(?:\(УИД\))?\s*([0-9a-fA-F-]{0,})/i);
-  if(!m) return '';
-  return ((m[1]||'')+(m[2]||'')).replace(/[^0-9a-fA-F-]/g,'').replace(/--+/g,'-');
+  // v11: УИД в Скоринг Бюро почти всегда перенесён на две строки:
+  // 07086782-....-a62c-  + следующая строка "(УИД) f9ed...-7".
+  let m=block.match(/Уникальный идентификатор договора\s+([0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}-)\s*[\r\n]+\s*(?:\(УИД\)\s*)?([0-9a-fA-F-]{4,})/i);
+  if(m) return ((m[1]||'')+(m[2]||'')).replace(/[^0-9a-fA-F-]/g,'').replace(/--+/g,'-');
+
+  m=block.match(/Уникальный идентификатор договора[\s\S]{0,140}?([0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})/i);
+  if(m) return (m[1]||'').replace(/[^0-9a-fA-F-]/g,'').replace(/--+/g,'-');
+
+  return '';
 }
 function creditMergeContractRows(rows){
   // v10.3: дедупликация ВНУТРИ одного БКИ должна быть строгой.
@@ -1336,37 +1342,147 @@ function creditMergeContractRows(rows){
   return groups;
 }
 
-function creditParseScoringContracts(text){
-  const out=[];
-  for(const block of creditScoringContractBlocks(text)){
-    const head=block.match(/Договор\s*№\s*(\d+)\s*-\s*([^\n]{2,180})/i);
-    const bank=creditScoringSource(block);
-    const dateM=block.match(/Дата совершения сделки\s*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
-    const amountM=block.match(/Сумма обязательства по договору\s*([\d\s]+(?:[.,]\d+)?)/i);
-    if(!dateM || bank==='Банк не определён') continue;
-    const overdueM=block.match(/Возникновение просроченной задолженности\s*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
-    const maxOdM=block.match(/Максимальная просрочка по основному долгу в днях\s*(\d+)/i);
-    const paidM=block.match(/Общая выплаченная сумма\s*([\d\s]+(?:[.,]\d+)?)/i);
-    const statusM=block.match(/Состояние договора\s*([^\n\r]{2,50})/i);
-    const idM=block.match(/ID договора\s*([A-Za-zА-Яа-я0-9._\/-]+)/i);
-    const actualEndM=block.match(/Дата фактического прекращения[\s\S]{0,60}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
-    const uid=creditScoringUid(block);
-    out.push({
-      type:'Договор',date:creditDate(dateM[1]),bank,source:bank,
-      amountNum:amountM?creditMoneyNumber(amountM[1]):null,amount:amountM?(amountM[1]||'').trim():'',
-      status:statusM?(statusM[1]||'').replace(/\s+/g,' ').trim():'',
-      contract:idM?idM[1]:'',uid,
-      product:head?(head[2]||'').replace(/\s+/g,' ').trim():'',
-      overdueDate:overdueM?creditDate(overdueM[1]):null,
-      maxOverdueDays:maxOdM?Number(maxOdM[1]):null,
-      paidTotal:paidM?creditMoneyNumber(paidM[1]):null,
-      actualEndDate:actualEndM?creditDate(actualEndM[1]):null,
-      bureauType:'scoring-block-v10',rawBlock:block
-    });
+function creditScoringSummaryRows(text){
+  const start=text.search(/СВОДНАЯ ИНФОРМАЦИЯ ПО ДОГОВОРАМ ЗАЙМА/i);
+  const firstDetail=text.search(/Договор\s*№\s*1\s*-/i);
+  if(start<0 || firstDetail<0 || firstDetail<=start) return [];
+
+  const part=text.slice(start,firstDetail);
+  const lines=part.split(/\r?\n/);
+  const rows=[];
+  let current=null;
+
+  for(const line of lines){
+    const rm=line.match(/^\s*(\d{1,3})\s+(\d{16,20})\s+(.+)$/);
+    if(rm){
+      if(current) rows.push(current);
+      current={ordinal:Number(rm[1]),id:rm[2],lines:[line]};
+      continue;
+    }
+    if(current) current.lines.push(line);
   }
-  // v10.4: НЕ дедуплицируем договорные блоки Скоринг Бюро внутри отчёта.
-  // Каждый «Договор №...» является самостоятельной записью БКИ.
-  return out;
+  if(current) rows.push(current);
+
+  // В отчётах Скоринг Бюро номера договоров идут подряд и соответствуют Договор №N.
+  return rows.filter(r=>r.ordinal>=1 && r.ordinal<=500);
+}
+
+function creditScoringSummaryBank(row){
+  if(!row || !row.lines || !row.lines.length) return 'Банк не определён';
+  const first=row.lines[0]
+    .replace(/^\s*\d{1,3}\s+\d{16,20}\s+/,'')
+    .trim();
+
+  const firstCells=first.split(/\s{2,}/).filter(Boolean);
+  const parts=[];
+
+  if(firstCells.length) parts.push(firstCells[0]);
+
+  for(const line of row.lines.slice(1,5)){
+    if(!line.trim()) continue;
+    if(/КУВАТОВ|Паспорт РФ|Дата создания отч[её]та|^№\s*ID договора|Итог \(RUB\)|Активные договоры|Закрытые договоры/i.test(line)) continue;
+
+    const cells=line.trim().split(/\s{2,}/).filter(Boolean);
+    if(!cells.length) continue;
+
+    let c=cells[0].trim();
+    if(/^(Необеспеченный|микрозаем|Иной|Заем|Кредитная|линия\/карта|Овердрафт|заем)$/i.test(c)) continue;
+    if(/^\d/.test(c)) continue;
+    if(c.length>1) parts.push(c);
+  }
+
+  return creditNormBank(parts.join(' '));
+}
+
+function creditParseScoringDetail(block){
+  const head=block.match(/Договор\s*№\s*(\d+)\s*-\s*([^\n]{2,180})/i);
+  if(!head) return null;
+
+  const dateM=block.match(/Дата совершения сделки\s*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
+  const amountM=block.match(/Сумма обязательства по договору\s*(\d[\d \u00A0]*(?:[.,]\d{1,2})?)/i);
+  const overdueM=block.match(/Возникновение просроченной задолженности\s*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
+  const maxOdM=block.match(/Максимальная просрочка по основному долгу в днях\s*(\d+)/i);
+  const paidM=block.match(/Общая выплаченная сумма\s*(\d[\d \u00A0]*(?:[.,]\d{1,2})?)/i);
+  const statusM=block.match(/Состояние договора\s*([^\n\r]{2,80})/i);
+  const idM=block.match(/ID договора\s*([A-Za-zА-Яа-я0-9._\/-]+)/i);
+  const actualEndM=block.match(/Дата фактического прекращения[\s\S]{0,90}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
+
+  return {
+    ordinal:Number(head[1]),
+    type:'Договор',
+    date:dateM?creditDate(dateM[1]):null,
+    bank:creditScoringSource(block),
+    source:creditScoringSource(block),
+    amountNum:amountM?creditMoneyNumber(amountM[1]):null,
+    amount:amountM?(amountM[1]||'').trim():'',
+    status:statusM?(statusM[1]||'').replace(/\s+/g,' ').trim():'',
+    contract:idM?idM[1]:'',
+    uid:creditScoringUid(block),
+    product:(head[2]||'').replace(/\s+/g,' ').trim(),
+    overdueDate:overdueM?creditDate(overdueM[1]):null,
+    maxOverdueDays:maxOdM?Number(maxOdM[1]):null,
+    paidTotal:paidM?creditMoneyNumber(paidM[1]):null,
+    actualEndDate:actualEndM?creditDate(actualEndM[1]):null,
+    bureauType:'scoring-detail-v11',
+    rawBlock:block
+  };
+}
+
+function creditParseScoringContracts(text){
+  const blocks=creditScoringContractBlocks(text);
+  const details=new Map();
+
+  for(const block of blocks){
+    const d=creditParseScoringDetail(block);
+    if(d) details.set(d.ordinal,d);
+  }
+
+  const summary=creditScoringSummaryRows(text);
+
+  // Главный путь v11: сводная таблица даёт номер, ID, сумму и дату начала.
+  // Детальная карточка по тому же № обогащает запись УИД, просрочкой и платежами.
+  if(summary.length>=Math.max(10,Math.floor(blocks.length*0.8))){
+    const out=[];
+
+    for(const row of summary){
+      const first=row.lines[0]||'';
+      const amountDate=first.match(/(\d[\d \u00A0]*[.,]\d{2})\s*RUB\s+(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
+      const d=details.get(row.ordinal)||null;
+
+      let bank=creditScoringSummaryBank(row);
+      if(bank==='Банк не определён' && d) bank=d.bank;
+
+      const date=amountDate?creditDate(amountDate[2]):(d?d.date:null);
+      const amountNum=amountDate?creditMoneyNumber(amountDate[1]):(d?d.amountNum:null);
+
+      if(!date || bank==='Банк не определён') continue;
+
+      out.push({
+        type:'Договор',
+        date,
+        bank,
+        source:bank,
+        amountNum,
+        amount:amountNum==null?'':String(amountNum),
+        status:d?.status||'',
+        contract:row.id || d?.contract || '',
+        uid:d?.uid||'',
+        product:d?.product||'',
+        overdueDate:d?.overdueDate||null,
+        maxOverdueDays:d?.maxOverdueDays??null,
+        paidTotal:d?.paidTotal??null,
+        actualEndDate:d?.actualEndDate||null,
+        bureauType:'scoring-summary-v11',
+        scoringOrdinal:row.ordinal,
+        rawBlock:d?.rawBlock||''
+      });
+    }
+
+    if(out.length>=Math.floor(summary.length*0.9)) return out;
+  }
+
+  // Резерв: детальные карточки без внутренней склейки.
+  return [...details.values()].filter(x=>x.date && x.bank!=='Банк не определён');
 }
 
 async function creditAiAnalyzeBlock(block,bureau='Скоринг Бюро'){
@@ -1436,78 +1552,171 @@ function creditScoringUnresolvedBlocks(text,parsed){
 }
 async function creditApplyAiFallback(doc){
   if(doc.bureau!=='Скоринг Бюро') return doc;
+
+  const blockCount=creditScoringContractBlocks(doc.text).length;
+  const localCount=doc.contracts.length;
+  const missingCritical=doc.contracts.filter(c=>!c.date || creditNormBank(c.bank)==='Банк не определён').length;
+
+  // v11: если локально прочитана почти вся сводная таблица, AI вообще не вызываем.
+  if(blockCount && localCount>=Math.floor(blockCount*0.95) && missingCritical===0){
+    return {...doc,aiFallback:{used:false,checked:0,recovered:0,error:null,reason:'local-complete'}};
+  }
+
   const unresolved=creditScoringUnresolvedBlocks(doc.text,doc.contracts);
   if(!unresolved.length) return {...doc,aiFallback:{used:false,checked:0,recovered:0,error:null}};
+
   const recovered=[];
   let error=null;
-  // Cost/privacy guard: only unresolved blocks, maximum 10 AI calls per report.
-  for(const block of unresolved.slice(0,10)){
+
+  for(const block of unresolved.slice(0,5)){
     try{ recovered.push(...await creditAiAnalyzeBlock(block,doc.bureau)); }
     catch(e){ error=e.message||String(e); break; }
   }
-  // AI добавляет только действительно новые записи и не склеивает исходные договоры Скоринг Бюро.
+
   const contracts=[...doc.contracts];
   let added=0;
 
   for(const c of recovered){
-    const uid=String(c.uid||'').trim();
-    const contract=String(c.contract||'').trim();
-
-    const duplicate=contracts.some(x=>{
-      if(uid && x.uid && String(x.uid).trim()===uid) return true;
-      if(contract && x.contract &&
-         String(x.contract).trim()===contract &&
-         creditBankSimilar(c.bank,x.bank)) return true;
-
-      // Только для AI-восстановления допускаем строгий soft-match:
-      // тот же кредитор + та же дата + одинаковая известная сумма.
-      if(!uid && !contract &&
-         c.amountNum && x.amountNum &&
-         creditBankSimilar(c.bank,x.bank) &&
-         creditFmt(c.date)===creditFmt(x.date) &&
-         Math.abs(c.amountNum-x.amountNum)<=1) return true;
-
-      return false;
-    });
-
-    if(!duplicate){
-      contracts.push(c);
-      added++;
-    }
+    const duplicate=contracts.some(x=>
+      (c.uid && x.uid && c.uid===x.uid) ||
+      (c.contract && x.contract && c.contract===x.contract && creditBankSimilar(c.bank,x.bank))
+    );
+    if(!duplicate){ contracts.push(c); added++; }
   }
 
   return {...doc,contracts,aiFallback:{
     used:true,
-    checked:Math.min(unresolved.length,10),
+    checked:Math.min(unresolved.length,5),
     recovered:added,
     error
   }};
 }
+
 function creditParseScoringApplications(text){
+  const lines=text.split(/\r?\n/);
+  let start=lines.findIndex(l=>/Дата\s+УИД обращения\s+Кредитор\s+Вид участия/i.test(l));
+  if(start<0) return [];
+
   const out=[];
-  const re=/(\d{1,4})\s+(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})\s+(?:Банк|МФО):\s*([\s\S]{2,180}?)\s+([\d\s]+(?:[.,]\d+)?)\s*₽\s+(Отказ|Одобрено|Одобрена|Договор заключ[её]н)/gi;
-  let m;
-  while((m=re.exec(text))){
-    const bank=creditNormBank(m[3]);
-    if(bank==='Банк не определён') continue;
-    out.push({type:'Заявка',date:creditDate(m[2]),source:bank,bank,amount:m[4],amountNum:creditMoneyNumber(m[4]),status:m[5],bureauType:'scoring-app'});
+  let current=null;
+
+  const flush=()=>{
+    if(!current) return;
+    const joined=current.lines.join(' ').replace(/\s+/g,' ').trim();
+
+    const statusM=joined.match(/\b(Отказ|Выдано|Одобрено|Одобрена|Договор заключ[её]н)\b/i);
+    if(!statusM){ current=null; return; }
+
+    const first=current.lines[0]||'';
+    const dateM=first.match(/^\s*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/);
+    const uidFirst=first.match(/^\s*\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4}\s+([0-9a-fA-F-]{8,})/i);
+
+    // Кредитор расположен между УИД и колонкой "Заемщик".
+    let bankRaw='';
+    const bm=joined.match(/[0-9a-fA-F-]{8,}\s+(.+?)\s+Заемщик\b/i);
+    if(bm) bankRaw=bm[1];
+
+    // Убираем возможный хвост второй строки УИД из начала названия.
+    bankRaw=bankRaw.replace(/^[0-9a-fA-F-]{5,}\s+/,'').trim();
+    const bank=creditNormBank(bankRaw);
+
+    if(!dateM || bank==='Банк не определён'){ current=null; return; }
+
+    const amountM=joined.match(/Заемщик\s+(\d[\d \u00A0]*(?:[.,]\d{2})?)\s*RUB/i);
+
+    out.push({
+      type:'Заявка',
+      date:creditDate(dateM[1]),
+      source:bank,
+      bank,
+      amount:amountM?amountM[1]:'',
+      amountNum:amountM?creditMoneyNumber(amountM[1]):null,
+      status:statusM[1],
+      uid:uidFirst?uidFirst[1]:'',
+      bureauType:'scoring-app-v11'
+    });
+
+    current=null;
+  };
+
+  for(let i=start+1;i<lines.length;i++){
+    const line=lines[i];
+
+    if(/СВЕДЕНИЯ О ЗАПРОСАХ КРЕДИТНОЙ ИСТОРИИ/i.test(line)){
+      flush();
+      break;
+    }
+
+    if(/^\s*\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4}\s+[0-9a-fA-F-]{8,}/.test(line)){
+      flush();
+      current={lines:[line]};
+    }else if(current){
+      // Следующие строки могут содержать продолжение УИД/наименования.
+      if(!/КУВАТОВ АРТЕМ|Паспорт РФ|Дата создания отч[её]та/i.test(line)){
+        current.lines.push(line);
+      }
+    }
   }
-  return creditUniq(out,x=>creditFmt(x.date)+'|'+x.bank+'|'+Math.round(x.amountNum||0)+'|'+String(x.status).toLowerCase());
+  flush();
+
+  // Здесь одна строка таблицы = одно обращение; внутри одного БКИ не схлопываем.
+  return out;
 }
+
 function creditParseScoringQueries(text){
+  const pos=text.lastIndexOf('СВЕДЕНИЯ О ЗАПРОСАХ КРЕДИТНОЙ ИСТОРИИ');
+  if(pos<0) return [];
+
+  const part=text.slice(pos);
+  const lines=part.split(/\r?\n/);
   const out=[];
-  const section=text.toUpperCase().indexOf('КТО ИНТЕРЕСОВАЛСЯ КРЕДИТНОЙ ИСТОРИЕЙ');
-  if(section<0) return out;
-  const part=text.slice(section);
-  const re=/(\d{1,4})\s+([А-ЯA-ZЁ0-9"'«»().\- ]{3,130})\s+(?:ПРОВЕРКА БЛАГОНАДЕЖНОСТИ|КОНТРОЛЬ ДАННЫХ|МОНИТОРИНГ|МАРКЕТИНГОВЫЕ ИССЛЕДОВАНИЯ|ПОТРЕБ[^\n]{0,40}|КР\.\s*КАРТА[^\n]{0,30}|ИПОТЕКА|МИКРОЗАЙМ|ИНОЕ[^\n]{0,30}|ЗАКЛЮЧЕНИЕ И ИСПОЛНЕНИЕ ДОГОВОРА)[\s ]*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/gi;
-  let m;
-  while((m=re.exec(part))){
-    const bank=creditNormBank(m[2]);
-    if(bank==='Банк не определён') continue;
-    out.push({type:'Запрос БКИ',date:creditDate(m[3]),source:bank,bank,amount:'',status:'',bureauType:'scoring-query'});
+  let current=null;
+
+  const flush=()=>{
+    if(!current) return;
+    const joined=current.lines.join(' ').replace(/\s+/g,' ').trim();
+    const dateM=joined.match(/^(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})\s+(Банк|МФО|Иной(?: пользователь)?)\s+(.+)/i);
+    if(!dateM){ current=null; return; }
+
+    let rest=dateM[3];
+    // Цель запроса начинается с устойчивых формулировок; всё до неё считаем пользователем.
+    const purposeRe=/\s+(Расчет кредитных предложений|РАСЧЕТ КРЕДИТНЫХ ПРЕДЛОЖЕНИЙ|Микрозайм|Мониторинг|Проверка благонадежности|Маркетинговые исследования|Контроль данных|Кредитная оценка \(скоринг\)|Потреб[^\s]{0,20}|Иной потреб|Проверка платежеспособности|Автокредит|Кредитная карта|Овердрафт)\b/i;
+    const pm=rest.match(purposeRe);
+
+    let bankRaw=pm?rest.slice(0,pm.index):rest;
+    bankRaw=bankRaw.trim();
+    const bank=creditNormBank(bankRaw);
+
+    if(bank==='Банк не определён'){ current=null; return; }
+
+    out.push({
+      type:'Запрос БКИ',
+      date:creditDate(dateM[1]),
+      source:bank,
+      bank,
+      purpose:pm?pm[1]:'',
+      amount:'',
+      status:'',
+      bureauType:'scoring-query-v11'
+    });
+    current=null;
+  };
+
+  for(const line of lines){
+    if(/^\s*\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4}\s+(?:Банк|МФО|Иной)/i.test(line)){
+      flush();
+      current={lines:[line.trim()]};
+    }else if(current){
+      if(!/КУВАТОВ АРТЕМ|Паспорт РФ|Дата создания отч[её]та/i.test(line)){
+        current.lines.push(line);
+      }
+    }
   }
-  return creditUniq(out,x=>creditFmt(x.date)+'|'+x.bank);
+  flush();
+
+  return out;
 }
+
 function creditParseOkbQueries(text){
   const out=[];
   // OKB detailed query cards often contain "Дата запроса" + source name.
@@ -1533,42 +1742,44 @@ function creditApplications(text){
 
 
 function creditParseOkbBlocks(text){
-  const out=[];
-  const dateRe=/Дата совершения сделки\s*(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/gi;
-  let dm;
+  const headingRe=/^\s*(\d{1,3})\.\s+(.+?)\s+-\s+Договор займа\s*\(кредита\)\s*-\s*(.*)$/gmi;
+  const starts=[];
+  let hm;
+  while((hm=headingRe.exec(text))){
+    starts.push({
+      index:hm.index,
+      ordinal:Number(hm[1]),
+      bankRaw:(hm[2]||'').trim(),
+      product:(hm[3]||'').trim()
+    });
+  }
 
-  while((dm=dateRe.exec(text))){
-    const dealDate=creditDate(dm[1]);
+  const out=[];
+
+  for(let i=0;i<starts.length;i++){
+    const h=starts[i];
+    const end=i+1<starts.length?starts[i+1].index:text.length;
+    const block=text.slice(h.index,end);
+
+    const bank=creditNormBank(h.bankRaw);
+    if(bank==='Банк не определён') continue;
+
+    const dateM=block.match(/Дата совершения сделки\s*(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
+    if(!dateM) continue;
+
+    const dealDate=creditDate(dateM[1]);
     if(!dealDate) continue;
 
-    const lookStart=Math.max(0,dm.index-3500);
-    const before=text.slice(lookStart,dm.index);
+    const amountM=block.match(/Сумма и валюта обязательства[\s\S]{0,260}?(\d[\d \u00A0]*(?:[.,]\d{1,2})?)\s*р\./i);
 
-    // Take the last contract heading before this exact deal date.
-    const headRe=/(\d{1,2})\.\s*([А-ЯA-ZЁ0-9"«»().\- ]{2,120})\s*-\s*Договор займа\s*\(кредита\)\s*-\s*([\s\S]{0,220}?)(?=(?:Закрыт|Переуступлен|Открыт|Действует|Сведения об источнике))/gi;
-    let hm,lastHead=null;
-    while((hm=headRe.exec(before))) lastHead=hm;
-    if(!lastHead) continue;
-
-    const bank=creditNormBank((lastHead[2]||'').replace(/\s+/g,' ').trim());
-    if(!bank || bank==='Банк не определён') continue;
-
-    const absoluteHeadStart=lookStart+lastHead.index;
-    const tail=text.slice(absoluteHeadStart,Math.min(text.length,absoluteHeadStart+22000));
-
-    // Stop at the next numbered detailed contract heading.
-    const nextRe=/\s\d{1,2}\.\s*[А-ЯA-ZЁ0-9"«»().\- ]{2,120}\s*-\s*Договор займа\s*\(кредита\)/gi;
-    nextRe.lastIndex=40;
-    const nm=nextRe.exec(tail);
-    const block=nm?tail.slice(0,nm.index):tail;
-
-    const amountM=block.match(/Сумма и валюта обязательства[\s\S]{0,320}?(\d[\d\s]*[.,]?\d*)\s*р\./i);
-    const idM=block.match(/Идентификатор сделки\s*([A-ZА-ЯЁ0-9_\-]+)/i);
+    // В ОКБ "Идентификатор сделки" — это тот же УИД, который Скоринг называет УИД.
+    const uidM=block.match(/Идентификатор сделки[^\n\r]*[\r\n]+[^\n\r]*?\s([0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})\s/i);
     const numberM=block.match(/Номер сделки\s*([^\n\r]{1,120})/i);
+
     const actualEndM=block.match(/Дата фактического прекращения обязательства\s*(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
     const basisM=block.match(/Основание прекращения обязательства\s*([\s\S]{0,180}?)(?=(?:Передача финансирования|Сведения об учете|Величина среднемесячного платежа|Условия платежей|$))/i);
-    const statusM=block.match(/\b(Закрыт|Переуступлен|Открыт|Действует)\b/i);
-    const paidM=block.match(/Сумма всех внесенных платежей[\s\S]{0,180}?По обязательству\s*(\d[\d\s]*[.,]?\d*)\s*р\./i);
+
+    const paidM=block.match(/Сумма всех внесенных платежей[\s\S]{0,180}?По обязательству\s*(\d[\d \u00A0]*(?:[.,]\d{1,2})?)\s*р\./i);
 
     const overdueDates=[];
     const odRe=/Просроченная[\s\S]{0,240}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/gi;
@@ -1580,8 +1791,12 @@ function creditParseOkbBlocks(text){
     overdueDates.sort((a,b)=>a-b);
 
     let contract='';
-    if(numberM && numberM[1].trim()!=='-') contract=numberM[1].trim().replace(/\s+/g,' ');
-    else if(idM) contract=idM[1];
+    if(numberM){
+      const n=numberM[1].trim().replace(/\s+/g,' ');
+      if(n && n!=='-') contract=n;
+    }
+
+    const actualEnd=actualEndM?creditDate(actualEndM[1]):null;
 
     out.push({
       type:'Договор',
@@ -1589,51 +1804,57 @@ function creditParseOkbBlocks(text){
       bank,
       source:bank,
       amountNum:amountM?creditMoneyNumber(amountM[1]):null,
-      amount:amountM?amountM[1].replace(/\s+/g,' ').trim():'',
-      status:statusM?statusM[1]:'',
+      amount:amountM?amountM[1].trim():'',
+      status:actualEnd?'Закрыт':'Действует',
       contract,
-      product:(lastHead[3]||'').replace(/\s+/g,' ').trim(),
+      uid:uidM?uidM[1]:'',
+      product:h.product,
       overdueDate:overdueDates.length?overdueDates[0]:null,
-      actualEndDate:actualEndM?creditDate(actualEndM[1]):null,
+      actualEndDate:actualEnd,
       terminationBasis:basisM?basisM[1].replace(/\s+/g,' ').trim():'',
       paidTotal:paidM?creditMoneyNumber(paidM[1]):null,
-      bureauType:'okb-block',
-      okbOrdinal:Number(lastHead[1])
+      bureauType:'okb-block-v11',
+      okbOrdinal:h.ordinal
     });
   }
 
-  return creditUniq(out,x=>{
-    if(x.contract) return creditNormBank(x.bank)+'|'+x.contract;
-    return creditNormBank(x.bank)+'|'+creditFmt(x.date)+'|'+(x.amountNum?Math.round(x.amountNum):'?');
-  });
+  // Один heading = один договор. Никакой внутренней soft-дедупликации.
+  return out;
 }
 
 function creditContracts(text){
-  const out=[];let m;
-
-  // 1) Exact OKB/Kredistoria contract blocks.
-  const okb=creditParseOkbBlocks(text);
-  out.push(...okb);
-
-  // 2) Scoring Bureau.
-  const scoreRe=/Договор\s*№\s*([0-9]+)\s*-\s*([^\n]{2,100})[\s\S]{0,220}?Источник информации:\s*Банк\s*:\s*([^\n]{2,100})[\s\S]{0,500}?(?:Сумма обязательства по договору|Лимит карты по договору)\s*([\d\s.,]+)[\s\S]{0,180}?Дата совершения сделки\s*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/gi;
-  while((m=scoreRe.exec(text))) out.push({type:'Договор',date:creditDate(m[5]),bank:creditNormBank(m[3]),source:creditNormBank(m[3]),amountNum:creditMoneyNumber(m[4]),amount:m[4].trim(),status:'',contract:m[1],product:(m[2]||'').trim(),overdueDate:null,bureauType:'scoring'});
-
-  // 3) NBKI.
-  const nbkiRe=/(\d+\.\s*)?([А-ЯA-ZЁ0-9"«»().\- ]{3,90})\s*-\s*Договор займа \(кредита\)[\s\S]{0,380}?Номер договора:\s*([A-ZА-ЯЁ0-9_\/.\-]+)[\s\S]{0,180}?Дата сделки[\s\S]{0,120}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})[\s\S]{0,170}?([\d\s.,]+)\s*RUB/gi;
-  while((m=nbkiRe.exec(text))) out.push({type:'Договор',date:creditDate(m[4]),bank:creditNormBank(m[2]),source:creditNormBank(m[2]),amountNum:creditMoneyNumber(m[5]),amount:m[5].trim(),status:'',contract:m[3],product:'Договор займа (кредита)',overdueDate:null,bureauType:'nbki'});
-
-  // Do not run the old generic OKB "date only" parser if exact blocks were found.
-  if(!okb.length){
-    const okbFallback=/Дата совершения сделки\s*(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})[\s\S]{0,260}?Тип сделки\s*Договор займа \(кредита\)/gi;
-    while((m=okbFallback.exec(text))){const bank=creditExtractBankBefore(text,m.index,1300);out.push({type:'Договор',date:creditDate(m[1]),bank,source:bank,amountNum:null,amount:'',status:'',contract:'',product:'Договор займа (кредита)',overdueDate:null,bureauType:'okb-fallback'});}
+  // v11: специализированные парсеры имеют приоритет.
+  const scoringBlocks=creditScoringContractBlocks(text);
+  if(scoringBlocks.length>=3){
+    return creditParseScoringContracts(text);
   }
 
-  return creditUniq(out,x=>{
-    // Contract number/ID is the strongest dedupe key when present.
-    if(x.contract) return 'id|'+creditNormBank(x.bank||x.source)+'|'+x.contract;
-    return 'soft|'+creditFmt(x.date)+'|'+creditNormBank(x.bank||x.source)+'|'+(x.amountNum?Math.round(x.amountNum/1000)*1000:'?');
-  }).filter(x=>x.date);
+  const okb=creditParseOkbBlocks(text);
+  if(okb.length>=3){
+    return okb;
+  }
+
+  // NBKI fallback
+  const out=[];
+  let m;
+  const nbkiRe=/(\d+\.\s*)?([А-ЯA-ZЁ0-9"«»().\- ]{3,90})\s*-\s*Договор займа \(кредита\)[\s\S]{0,380}?Номер договора:\s*([A-ZА-ЯЁ0-9_\/.\-]+)[\s\S]{0,180}?Дата сделки[\s\S]{0,120}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})[\s\S]{0,170}?([\d\s.,]+)\s*RUB/gi;
+  while((m=nbkiRe.exec(text))){
+    out.push({
+      type:'Договор',
+      date:creditDate(m[4]),
+      bank:creditNormBank(m[2]),
+      source:creditNormBank(m[2]),
+      amountNum:creditMoneyNumber(m[5]),
+      amount:m[5].trim(),
+      status:'',
+      contract:m[3],
+      uid:'',
+      product:'Договор займа (кредита)',
+      overdueDate:null,
+      bureauType:'nbki'
+    });
+  }
+  return out.filter(x=>x.date && x.bank!=='Банк не определён');
 }
 
 function creditQueries(text){
@@ -1681,204 +1902,170 @@ function creditDedupLoans(docs){
     !creditIsStructuralName(x.bank||x.source)
   );
 
-  const quality=x=>
-    (x.uid?10:0)+(x.contract?5:0)+(x.amountNum?3:0)+
-    (x.overdueDate?3:0)+(x.paidTotal?2:0);
-
-  all.sort((a,b)=>quality(b)-quality(a));
   const groups=[];
+  const used=new Set();
 
-  const amountState=(a,b)=>{
-    if(a && b){
-      const diff=Math.abs(a-b);
-      if(diff<=1) return {ok:true,score:30,label:'точная сумма'};
-      if(diff<=Math.max(1500,Math.min(a,b)*0.015))
-        return {ok:true,score:15,label:'сумма близка'};
-      return {ok:false,score:0,label:'суммы различаются'};
+  // 1. Точные УИД. Это основной и самый надёжный путь.
+  const uidMap=new Map();
+  all.forEach((c,i)=>{
+    const uid=String(c.uid||'').trim().toLowerCase();
+    if(!uid) return;
+    if(!uidMap.has(uid)) uidMap.set(uid,[]);
+    uidMap.get(uid).push({c,i});
+  });
+
+  for(const [uid,items] of uidMap){
+    const bureaus=[...new Set(items.map(x=>x.c.bureau))];
+    if(bureaus.length<2) continue;
+
+    // Не объединяем более одной записи одного и того же БКИ в одну группу.
+    const chosen=[];
+    const seenB=new Set();
+    for(const item of items){
+      if(seenB.has(item.c.bureau)) continue;
+      seenB.add(item.c.bureau);
+      chosen.push(item);
     }
-    return {ok:true,score:0,label:'сумма отсутствует в одном БКИ'};
-  };
+    if(chosen.length<2) continue;
 
-  const overdueState=(a,b)=>{
-    if(!a || !b) return {ok:true,score:0,label:null};
-    const d=creditAbsDays(a,b);
-    if(d===0) return {ok:true,score:15,label:'точная дата первой просрочки'};
-    if(d===1) return {ok:true,score:7,label:'первая просрочка ±1 день'};
-    return {ok:false,score:0,label:'разные даты первой просрочки'};
-  };
+    const base={...chosen[0].c};
+    base.sources=chosen.map(x=>x.c.bureau);
+    base.sourceCount=base.sources.length;
+    base.crossBkiMatches=[];
 
-  const scorePair=(c,g)=>{
-    if(!creditBankSimilar(c.bank,g.bank)) return null;
-
-    const cuid=String(c.uid||'').trim();
-    const guid=String(g.uid||'').trim();
-    const cid=String(c.contract||'').trim();
-    const gid=String(g.contract||'').trim();
-
-    if(cuid && guid && cuid===guid){
-      return {score:140,reasons:['UID'],tier:'high'};
-    }
-
-    if(cid && gid && cid===gid){
-      return {score:120,reasons:['ID договора','кредитор'],tier:'high'};
-    }
-
-    const dayDiff=creditAbsDays(c.date,g.date);
-    if(dayDiff>1) return null;
-
-    let score=20;
-    const reasons=['кредитор'];
-
-    if(dayDiff===0){
-      score+=30;
-      reasons.push('точная дата');
-    }else{
-      score+=12;
-      reasons.push('дата ±1 день');
-    }
-
-    const a=amountState(c.amountNum,g.amountNum);
-    if(!a.ok) return null;
-    score+=a.score;
-    reasons.push(a.label);
-
-    const o=overdueState(c.overdueDate,g.overdueDate);
-    if(!o.ok) return null;
-    score+=o.score;
-    if(o.label) reasons.push(o.label);
-
-    return {score,reasons,tier:score>=80?'high':score>=50?'medium':'low'};
-  };
-
-  // Возвращает кандидатов для записи среди групп другого БКИ.
-  const candidatesFor=(c,pool)=>{
-    return pool
-      .filter(g=>!(g.sources||[]).includes(c.bureau))
-      .map(g=>({g,m:scorePair(c,g)}))
-      .filter(x=>x.m)
-      .sort((a,b)=>b.m.score-a.m.score);
-  };
-
-  for(const c of all){
-    const bank=creditNormBank(c.bank||c.source);
-    const pool=groups.filter(g=>!(g.sources||[]).includes(c.bureau));
-    const scored=candidatesFor(c,pool);
-
-    let existing=null;
-    let selectedMeta=null;
-
-    if(scored.length){
-      const best=scored[0];
-
-      // Надёжный UID/ID объединяем сразу.
-      if(best.m.score>=120){
-        existing=best.g;
-        selectedMeta=best.m;
-      } else {
-        // Для мягкого совпадения требуем взаимную однозначность:
-        // у текущей записи один лучший кандидат, и у этого кандидата
-        // текущая запись также является единственным лучшим кандидатом.
-        const sameTop=scored.filter(x=>x.m.score===best.m.score);
-        const currentUnique=sameTop.length===1;
-
-        const reversePool=all.filter(x=>
-          x.bureau!==best.g.bureau &&
-          x.bureau===c.bureau &&
-          x._rowIndex!==c._rowIndex
-        );
-
-        const reverseScored=reversePool
-          .map(x=>({x,m:scorePair(x,best.g)}))
-          .filter(x=>x.m)
-          .sort((a,b)=>b.m.score-a.m.score);
-
-        const reverseBest=reverseScored[0];
-        const reverseSameTop=reverseBest
-          ? reverseScored.filter(x=>x.m.score===reverseBest.m.score)
-          : [];
-
-        const reverseAmbiguous=reverseBest &&
-          reverseBest.m.score>=best.m.score &&
-          reverseSameTop.length>0;
-
-        // v10.8: одного совпадения кредитора и даты недостаточно.
-        // Для автоматической склейки нужен дополнительный подтверждающий признак:
-        // совпавшая/близкая сумма либо совпавшая дата первой просрочки.
-        const hasAmountEvidence=
-          best.m.reasons.includes('точная сумма') ||
-          best.m.reasons.includes('сумма близка');
-
-        const hasOverdueEvidence=
-          best.m.reasons.includes('точная дата первой просрочки') ||
-          best.m.reasons.includes('первая просрочка ±1 день');
-
-        const acceptableScore=
-          best.m.score>=65 &&
-          (hasAmountEvidence || hasOverdueEvidence);
-
-        if(currentUnique && !reverseAmbiguous && acceptableScore){
-          existing=best.g;
-          selectedMeta=best.m;
-        }
-      }
-    }
-
-    if(existing){
-      existing.sources=[...new Set([...(existing.sources||[]),c.bureau])];
-      existing.sourceCount=existing.sources.length;
-      existing.crossBkiMatches=existing.crossBkiMatches||[];
-      existing.crossBkiMatches.push({
+    for(const item of chosen.slice(1)){
+      const c=item.c;
+      base.crossBkiMatches.push({
         bureau:c.bureau,
         bank:c.bank,
         date:c.date,
         amountNum:c.amountNum,
         uid:c.uid||'',
         contract:c.contract||'',
-        score:selectedMeta.score,
-        reasons:selectedMeta.reasons,
-        reliability:selectedMeta.score>=120?'высокая':
-                    selectedMeta.score>=80?'высокая':
-                    selectedMeta.score>=65?'средняя':'не объединять'
+        score:200,
+        reasons:['точный УИД'],
+        reliability:'высокая'
       });
 
-      for(const f of [
-        'uid','contract','amountNum','amount','overdueDate',
-        'maxOverdueDays','paidTotal','actualEndDate','status',
-        'product','terminationBasis'
-      ]){
-        if((existing[f]==null||existing[f]==='') && c[f]!=null && c[f]!==''){
-          existing[f]=c[f];
-        }
+      for(const f of ['contract','amountNum','amount','overdueDate','maxOverdueDays','paidTotal','actualEndDate','status','product','terminationBasis']){
+        if((base[f]==null||base[f]==='') && c[f]!=null && c[f]!=='') base[f]=c[f];
       }
-    }else{
-      groups.push({
-        ...c,
-        bank,
-        sources:[c.bureau],
-        sourceCount:1,
-        crossBkiMatches:[]
-      });
+      used.add(item.i);
     }
+    used.add(chosen[0].i);
+    groups.push(base);
+  }
+
+  // 2. Оставшиеся записи. Мягко объединяем только взаимно-однозначные пары
+  //    с совпавшим кредитором, датой ±1 день и известной совместимой суммой.
+  const remaining=all.map((c,i)=>({c,i})).filter(x=>!used.has(x.i));
+
+  const pairScore=(a,b)=>{
+    if(a.bureau===b.bureau) return null;
+    if(!creditBankSimilar(a.bank,b.bank)) return null;
+
+    const dd=creditAbsDays(a.date,b.date);
+    if(dd>1) return null;
+
+    if(!a.amountNum || !b.amountNum) return null;
+    const diff=Math.abs(a.amountNum-b.amountNum);
+    if(diff>Math.max(1000,Math.min(a.amountNum,b.amountNum)*0.01)) return null;
+
+    let score=100;
+    const reasons=['кредитор'];
+    if(dd===0){score+=20;reasons.push('точная дата');}
+    else {score+=10;reasons.push('дата ±1 день');}
+
+    if(diff<=1){score+=30;reasons.push('точная сумма');}
+    else {score+=15;reasons.push('сумма близка');}
+
+    if(a.overdueDate && b.overdueDate && creditAbsDays(a.overdueDate,b.overdueDate)<=1){
+      score+=10;
+      reasons.push('совпадает первая просрочка');
+    }
+
+    return {score,reasons};
+  };
+
+  const candidates=[];
+  for(let i=0;i<remaining.length;i++){
+    for(let j=i+1;j<remaining.length;j++){
+      const A=remaining[i],B=remaining[j];
+      const m=pairScore(A.c,B.c);
+      if(m) candidates.push({A,B,m});
+    }
+  }
+  candidates.sort((x,y)=>y.m.score-x.m.score);
+
+  const softUsed=new Set();
+
+  for(const p of candidates){
+    if(softUsed.has(p.A.i)||softUsed.has(p.B.i)) continue;
+
+    // Проверяем, что у каждой стороны нет равного/лучшего конкурирующего кандидата.
+    const altA=candidates.filter(x=>
+      (x.A.i===p.A.i||x.B.i===p.A.i) &&
+      x!==p &&
+      x.m.score>=p.m.score &&
+      !softUsed.has(x.A.i) && !softUsed.has(x.B.i)
+    );
+    const altB=candidates.filter(x=>
+      (x.A.i===p.B.i||x.B.i===p.B.i) &&
+      x!==p &&
+      x.m.score>=p.m.score &&
+      !softUsed.has(x.A.i) && !softUsed.has(x.B.i)
+    );
+    if(altA.length||altB.length) continue;
+
+    const a=p.A.c,b=p.B.c;
+    const base={...a};
+    base.sources=[a.bureau,b.bureau];
+    base.sourceCount=2;
+    base.crossBkiMatches=[{
+      bureau:b.bureau,
+      bank:b.bank,
+      date:b.date,
+      amountNum:b.amountNum,
+      uid:b.uid||'',
+      contract:b.contract||'',
+      score:p.m.score,
+      reasons:p.m.reasons,
+      reliability:'средняя'
+    }];
+
+    for(const f of ['uid','contract','amountNum','amount','overdueDate','maxOverdueDays','paidTotal','actualEndDate','status','product','terminationBasis']){
+      if((base[f]==null||base[f]==='') && b[f]!=null && b[f]!=='') base[f]=b[f];
+    }
+
+    groups.push(base);
+    softUsed.add(p.A.i);
+    softUsed.add(p.B.i);
+  }
+
+  for(const {c,i} of remaining){
+    if(softUsed.has(i)) continue;
+    groups.push({...c,sources:[c.bureau],sourceCount:1,crossBkiMatches:[]});
   }
 
   return groups.sort((a,b)=>b.date-a.date);
 }
+
 function creditDedupApps(docs){
   const all=docs.flatMap(d=>d.applications.map(a=>({...a,bureau:d.bureau,bank:creditNormBank(a.bank||a.source)})))
-    .filter(a=>a.date && a.bank!=='Банк не определён');
+    .filter(a=>a.date&&a.bank!=='Банк не определён');
+
   const out=[];
-  all.sort((a,b)=>b.date-a.date);
+  const seen=new Set();
+
   for(const a of all){
-    const amt=a.amountNum||creditMoneyNumber(a.amount);
-    const existing=out.find(x=>{
-      const day=creditAbsDays(x.date,a.date);
-      if(day>1 || x.bank!==a.bank) return false;
-      const xa=x.amountNum||creditMoneyNumber(x.amount);
-      const amountMatch=!xa||!amt||Math.abs(xa-amt)<=Math.max(2000,Math.min(xa,amt)*0.03);
-      return amountMatch && String(x.status||'').toLowerCase()===String(a.status||'').toLowerCase();
-    });
-    if(existing) existing.sources=[...new Set([...(existing.sources||[]),a.bureau])];
-    else out.push({...a,amountNum:amt,sources:[a.bureau]});
+    const uid=String(a.uid||'').trim().toLowerCase();
+    const key=uid
+      ? 'uid|'+uid
+      : creditFmt(a.date)+'|'+creditBankFingerprint(a.bank)+'|'+Math.round(a.amountNum||0)+'|'+String(a.status||'').toLowerCase();
+
+    if(seen.has(key)) continue;
+    seen.add(key);
+    out.push(a);
   }
   return out;
 }
@@ -2046,7 +2233,7 @@ function creditRenderResult(docs){
   const loans=creditDedupLoans(docs);
   const apps=creditDedupApps(docs);
   const queries=creditUniq(docs.flatMap(d=>d.queries.map(q=>({...q,bureau:d.bureau,bank:creditNormBank(q.bank||q.source)})))
-    .filter(q=>q.date&&q.bank!=='Банк не определён'),q=>creditFmt(q.date)+'|'+q.bank);
+    .filter(q=>q.date&&q.bank!=='Банк не определён'),q=>creditFmt(q.date)+'|'+q.bank+'|'+String(q.purpose||''));
   const verdict=creditOverallVerdict(loans,apps);
   const rejected=apps.filter(a=>/отказ/i.test(a.status||'')).length;
   const confirmed2=loans.filter(l=>(l.sources||[]).length>=2).length;
@@ -2148,7 +2335,7 @@ function creditRenderResult(docs){
 
     <div class="merge-card">
       <h3>После объединения БКИ</h3>
-      <p>Локальный парсер исключает служебные заголовки. Нераспознанные блоки Скоринг Бюро при необходимости проверяются AI. Договоры объединяются по УИД/ID либо по сильному совпадению: кредитор + дата + дополнительный подтверждающий признак (сумма или дата первой просрочки). Совпадение только по кредитору и дате не считается подтверждением.</p>
+      <p>Локальный парсер исключает служебные заголовки. Нераспознанные блоки Скоринг Бюро при необходимости проверяются AI. Основное объединение договоров выполняется по точному УИД. Резервное сопоставление допускается только для взаимно-однозначных пар с совпавшим кредитором, датой ±1 день и совместимой известной суммой.</p>
       <div class="merge-pills">
         <span class="merge-pill">Уникальных договоров: ${loans.length}</span>
         <span class="merge-pill">Подтверждены 2+ БКИ: ${confirmed2}</span>
