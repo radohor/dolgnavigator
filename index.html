@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v19 selective AI: локальный код читает только те разделы, которые уже показали стабильность; AI получает не весь PDF, а только проблемные структурные записи. Скоринг: договоры и запросы читаются локально, заявления — AI по строкам таблицы. ОКБ: договорные карточки — AI по готовым блокам; остальные разделы остаются локальными. Это резко уменьшает число AI-вызовов и время анализа.</div>
+<div class="analyzer-note">v20 indexed AI: AI получает только проблемные структурные записи, но теперь каждая запись имеет обязательный item_index. Модель обязана вернуть результат по каждому входному item_index; пустой ответ или пропуск фиксируется как ошибка покрытия, а не как успешный AI-вызов. Пакеты укрупнены для сокращения времени анализа.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -2379,7 +2379,7 @@ function creditOkbContractBlocks(text){
   return blocks;
 }
 
-function creditBatchTextItems(items,maxChars=28000,maxItems=40,label='ITEM'){
+function creditBatchTextItems(items,maxChars=42000,maxItems=80,label='ITEM'){
   const batches=[];
   let current=[];
   let chars=0;
@@ -2393,9 +2393,13 @@ function creditBatchTextItems(items,maxChars=28000,maxItems=40,label='ITEM'){
 
   for(let i=0;i<items.length;i++){
     const payload=typeof items[i]==='string'?items[i]:(items[i].text||'');
-    const wrapped=`[[${label} ${i+1}]]\n${payload}\n`;
+    const wrapped=`[[${label} item_index=${i+1}]]\n${payload}\n[[END_${label} item_index=${i+1}]]`;
     if(current.length && (chars+wrapped.length>maxChars || current.length>=maxItems)) flush();
-    current.push({index:i,text:wrapped,original:items[i]});
+    current.push({
+      index:i+1,
+      text:wrapped,
+      original:items[i]
+    });
     chars+=wrapped.length;
   }
   flush();
@@ -2415,7 +2419,7 @@ async function creditSelectiveAiRequest(kind,batch,bureau,fileName,batchIndex,to
         fileName,
         batchIndex,
         totalBatches,
-        itemIndexes:batch.map(x=>x.index+1)
+        itemIndexes:batch.map(x=>x.index)
       }
     })
   });
@@ -2454,6 +2458,7 @@ async function creditRunBatches(batches,worker,onProgress,concurrency=5){
 async function creditSelectiveAnalyzeDoc(doc,onProgress){
   const bureau=creditDetectBureau(doc.text);
   let contracts=[],applications=[],queries=[];
+  let analyzedScoringCoverage=null, analyzedOkbCoverage=null;
   let aiCalls=0,aiFailures=0;
   const warnings=[];
 
@@ -2464,7 +2469,7 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
 
     // Проблемный раздел: заявления. AI получает только 278 структурных строк.
     const rows=creditScoringApplicationRows(doc.text);
-    const batches=creditBatchTextItems(rows,26000,45,'APPLICATION_ROW');
+    const batches=creditBatchTextItems(rows,46000,90,'APPLICATION_ROW');
 
     const results=await creditRunBatches(
       batches,
@@ -2473,7 +2478,7 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
         return creditSelectiveAiRequest('applications_rows',batch,bureau,doc.name,bi+1,total);
       },
       onProgress,
-      5
+      4
     );
 
     const recovered=[];
@@ -2482,9 +2487,23 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
       recovered.push(...(x.r.applications||[]));
     }
 
-    applications=creditAiFirstDedupApplications(
-      recovered.map(a=>creditAiNormalizeApplication(a,bureau,{startPage:null}))
+    const normalizedApps=recovered.map(a=>creditAiNormalizeApplication(a,bureau,{startPage:null}));
+    applications=creditAiFirstDedupApplications(normalizedApps);
+
+    const returnedIndexes=new Set(
+      normalizedApps.map(a=>a.aiItemIndex).filter(Boolean)
     );
+    const missingIndexes=rows.map((_,i)=>i+1).filter(i=>!returnedIndexes.has(i));
+
+    if(missingIndexes.length){
+      warnings.push(`AI не вернул ${missingIndexes.length} из ${rows.length} строк заявок`);
+    }
+
+    analyzedScoringCoverage={
+      expected:rows.length,
+      returned:returnedIndexes.size,
+      missing:missingIndexes.length
+    };
 
   }else if(bureau==='ОКБ / Кредистория'){
     // ОКБ-заявки/запросы локально уже извлекаются; не тратим AI.
@@ -2493,7 +2512,7 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
 
     // Проблемный раздел: 56 договорных карточек.
     const blocks=creditOkbContractBlocks(doc.text);
-    const batches=creditBatchTextItems(blocks,30000,8,'CONTRACT_BLOCK');
+    const batches=creditBatchTextItems(blocks,46000,18,'CONTRACT_BLOCK');
 
     const results=await creditRunBatches(
       batches,
@@ -2502,7 +2521,7 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
         return creditSelectiveAiRequest('contracts_blocks',batch,bureau,doc.name,bi+1,total);
       },
       onProgress,
-      5
+      4
     );
 
     const recovered=[];
@@ -2511,9 +2530,23 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
       recovered.push(...(x.r.contracts||[]));
     }
 
-    contracts=creditAiFirstDedupContracts(
-      recovered.map(c=>creditAiNormalizeContract(c,bureau,{startPage:null}))
+    const normalizedContracts=recovered.map(c=>creditAiNormalizeContract(c,bureau,{startPage:null}));
+    contracts=creditAiFirstDedupContracts(normalizedContracts);
+
+    const returnedIndexes=new Set(
+      normalizedContracts.map(c=>c.aiItemIndex).filter(Boolean)
     );
+    const missingIndexes=blocks.map((_,i)=>i+1).filter(i=>!returnedIndexes.has(i));
+
+    if(missingIndexes.length){
+      warnings.push(`AI не вернул ${missingIndexes.length} из ${blocks.length} карточек договоров`);
+    }
+
+    analyzedOkbCoverage={
+      expected:blocks.length,
+      returned:returnedIndexes.size,
+      missing:missingIndexes.length
+    };
 
   }else{
     // Неизвестный формат: безопасный fallback на старый локальный анализ.
@@ -2534,7 +2567,9 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
     selectiveAi:{
       calls:aiCalls,
       failures:aiFailures,
-      warnings
+      warnings,
+      coverage: bureau==='Скоринг Бюро' ? analyzedScoringCoverage :
+                bureau==='ОКБ / Кредистория' ? analyzedOkbCoverage : null
     }
   };
 
@@ -2554,6 +2589,8 @@ async function creditSelectiveAnalyzeDoc(doc,onProgress){
     anomalies.push(`запросы ${queries.length}/${signals.queryMarkers}`);
 
   if(aiFailures) anomalies.push(`ошибок AI-вызовов: ${aiFailures}`);
+  if(analyzedScoringCoverage?.missing) anomalies.push(`AI-покрытие заявок ${analyzedScoringCoverage.returned}/${analyzedScoringCoverage.expected}`);
+  if(analyzedOkbCoverage?.missing) anomalies.push(`AI-покрытие договоров ${analyzedOkbCoverage.returned}/${analyzedOkbCoverage.expected}`);
 
   analyzed.selectiveAi.signals=signals;
   analyzed.selectiveAi.anomalies=anomalies;
@@ -2656,7 +2693,8 @@ function creditAiNormalizeContract(c,bureau,chunk){
     bureauType:'ai-first-contract-v18',
     aiSourcePage:creditAiPageNumber(c.source_page,chunk.startPage),
     aiConfidence:c.confidence||'',
-    aiEvidence:c.evidence||''
+    aiEvidence:c.evidence||'',
+    aiItemIndex:Number(c.item_index||0)||null
   };
 }
 
@@ -2674,7 +2712,8 @@ function creditAiNormalizeApplication(a,bureau,chunk){
     bureauType:'ai-first-application-v18',
     aiSourcePage:creditAiPageNumber(a.source_page,chunk.startPage),
     aiConfidence:a.confidence||'',
-    aiEvidence:a.evidence||''
+    aiEvidence:a.evidence||'',
+    aiItemIndex:Number(a.item_index||0)||null
   };
 }
 
@@ -3299,7 +3338,7 @@ function creditRenderResult(docs){
   );
   const aiQualityGateHtml=aiFirstProblems.length?`
     <div class="finding-card risk">
-      <h4>Selective AI обнаружил неполный разбор БКИ</h4>
+      <h4>Indexed AI обнаружил неполный разбор БКИ</h4>
       <p>${aiFirstProblems.map(escapeHtml).join('<br>')}</p>
       <p><b>Юридический вывод ниже считается предварительным до повторной проверки проблемного раздела.</b></p>
     </div>`:'';
@@ -3322,7 +3361,7 @@ function creditRenderResult(docs){
     const rej=d.applications.filter(a=>/отказ/i.test(a.status||'')).length;
     const af=d.selectiveAi;
     const sig=af?.signals||creditLocalSignals(d);
-    const aiLine=af?`<div style="margin-top:8px;font-size:12px;color:${af.verdict==='complete'?'#607077':'#9a3412'}"><b>Selective AI:</b> ${escapeHtml(af.verdict||'')} · AI-вызовов ${af.calls||0} · ошибок ${af.failures||0}</div>`:'';
+    const aiLine=af?`<div style="margin-top:8px;font-size:12px;color:${af.verdict==='complete'?'#607077':'#9a3412'}"><b>Indexed AI:</b> ${escapeHtml(af.verdict||'')} · AI-вызовов ${af.calls||0} · ошибок ${af.failures||0}${af.coverage?' · покрытие '+af.coverage.returned+'/'+af.coverage.expected:''}</div>`:'';
     const qcLine=af?`<div style="margin-top:3px;font-size:11px;color:#607077">Структурный контроль: договоры ${dc.length}/${sig.contractMarkers||'—'} · заявки ${d.applications.length}/${sig.applicationMarkers||'—'} · запросы ${d.queries.length}/${sig.queryMarkers||'—'}</div>`:'';
     const qcWarn=af?.anomalies?.length?`<div style="margin-top:4px;font-size:12px;color:#8a5a00">${af.anomalies.map(w=>escapeHtml(w)).join(' · ')}</div>`:'';
     return `<div class="source-card">
