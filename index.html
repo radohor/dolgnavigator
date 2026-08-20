@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v14 BKI core: ОКБ разбирается по 56 фактическим блокам «Общие сведения о сделке», Скоринг — по 98 договорным карточкам, таблице кредитных заявлений и таблице запросов. УИД является главным ключом между БКИ; разные УИД запрещают мягкую склейку. AI проверяет полноту каждого раздела по структурным маркерам, а не только начало PDF.</div>
+<div class="analyzer-note">v15 BKI real structure: парсеры привязаны к фактической структуре файлов Куватова. ОКБ: одна строка «N. кредитор — Договор займа (кредита)» = одна карточка. Скоринг: одна строка «Договор №N» = одна карточка; заявки считаются только по строкам дата+УИД, запросы — по строкам дата+тип пользователя. УИД между ОКБ и Скорингом собирается полностью, включая перенос внутри карточки.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1298,15 +1298,23 @@ function creditScoringSource(block){
   return 'Банк не определён';
 }
 function creditScoringUid(block){
-  // v11: УИД в Скоринг Бюро почти всегда перенесён на две строки:
-  // 07086782-....-a62c-  + следующая строка "(УИД) f9ed...-7".
-  let m=block.match(/Уникальный идентификатор договора\s+([0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}-)\s*[\r\n]+\s*(?:\(УИД\)\s*)?([0-9a-fA-F-]{4,})/i);
-  if(m) return ((m[1]||'')+(m[2]||'')).replace(/[^0-9a-fA-F-]/g,'').replace(/--+/g,'-');
+  // Фактический формат Скоринг Бюро:
+  // "Уникальный идентификатор договора 447af823-....-"
+  // затем другие колонки таблицы, затем "(УИД) 3cfdfed12dbd-5".
+  // Поэтому между двумя частями УИД может находиться до нескольких сотен символов.
+  let m=block.match(
+    /Уникальный идентификатор договора\s+([0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}-)[\s\S]{0,500}?\(УИД\)\s+([0-9a-fA-F-]{5,})/i
+  );
+  if(m){
+    return ((m[1]||'')+(m[2]||''))
+      .replace(/\s+/g,'')
+      .replace(/--+/g,'-')
+      .toLowerCase();
+  }
 
-  m=block.match(/Уникальный идентификатор договора[\s\S]{0,140}?([0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})/i);
-  if(m) return (m[1]||'').replace(/[^0-9a-fA-F-]/g,'').replace(/--+/g,'-');
-
-  return '';
+  // Резерв для карточек, где УИД уже собран в одну строку.
+  m=block.match(/Уникальный идентификатор договора[\s\S]{0,220}?([0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})/i);
+  return m?(m[1]||'').replace(/\s+/g,'').replace(/--+/g,'-').toLowerCase():'';
 }
 function creditMergeContractRows(rows){
   // v10.3: дедупликация ВНУТРИ одного БКИ должна быть строгой.
@@ -1486,11 +1494,22 @@ function creditParseScoringContracts(text){
       });
     }
 
-    if(out.length>=Math.floor(summary.length*0.9)) return out;
+    // Если сводная таблица не дала одну из 98 карточек, не теряем её:
+    // добавляем отсутствующий номер из детального блока.
+    const present=new Set(out.map(x=>x.scoringOrdinal||x.ordinal).filter(Boolean));
+    for(const [ordinal,d] of details){
+      if(present.has(ordinal)) continue;
+      if(!d?.date) continue;
+      out.push({...d,scoringOrdinal:ordinal});
+    }
+
+    if(out.length>=Math.floor(Math.max(summary.length,details.size)*0.9)){
+      return out.sort((a,b)=>(a.scoringOrdinal||999)-(b.scoringOrdinal||999));
+    }
   }
 
   // Резерв: детальные карточки без внутренней склейки.
-  return [...details.values()].filter(x=>x.date && x.bank!=='Банк не определён');
+  return [...details.values()].filter(x=>x.date);
 }
 
 
@@ -1598,22 +1617,28 @@ function creditLocalSignals(doc){
   };
 
   if(doc.bureau==='Скоринг Бюро'){
-    signals.contractMarkers=(t.match(/Договор\s*№\s*\d+\s*-/gi)||[]).length;
+    // Не считаем упоминания "Договор №" внутри текста — только заголовки карточек.
+    signals.contractMarkers=(t.match(/^\s*Договор\s*№\s*\d+\s*-/gmi)||[]).length;
 
     const aStart=t.search(/Сведения об обращении субъекта к источнику с предложением совершить сделку/i);
     const qStart=t.lastIndexOf('СВЕДЕНИЯ О ЗАПРОСАХ КРЕДИТНОЙ ИСТОРИИ');
+
     if(aStart>=0){
       const ap=t.slice(aStart,qStart>aStart?qStart:t.length);
-      signals.applicationMarkers=(ap.match(/\b\d{2}\.\d{2}\.\d{4}\s+[0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}/g)||[]).length;
+      signals.applicationMarkers=(ap.match(/^\s*\d{2}\.\d{2}\.\d{4}\s+[0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}/gm)||[]).length;
     }
+
     if(qStart>=0){
       const qp=t.slice(qStart);
-      signals.queryMarkers=(qp.match(/\b\d{2}\.\d{2}\.\d{4}\s+(?:Банк|МФО|Иной(?: пользователь)?)/gi)||[]).length;
+      signals.queryMarkers=(qp.match(/^\s*\d{2}\.\d{2}\.\d{4}\s+(?:Банк|МФО|Иной(?: пользователь)?)/gmi)||[]).length;
     }
   }else if(doc.bureau==='ОКБ / Кредистория'){
-    signals.contractMarkers=(t.match(/Общие сведения о сделке/gi)||[]).length;
-    signals.applicationMarkers=(t.match(/(?:Заявк|Обращени)[а-яё ]{0,20}(?:кредит|займ)/gi)||[]).length;
-    signals.queryMarkers=(t.match(/(?:Дата запроса|Кто интересовался кредитной историей)/gi)||[]).length;
+    signals.contractMarkers=(t.match(/^\s*\d{1,3}\.\s*.*?-\s*Договор займа\s*\(кредита\)\s*-/gmi)||[]).length;
+
+    // Для заявок и запросов ОКБ текущие таблицы не имеют столь же надёжного
+    // построчного маркера. Не используем ложные "20" и "39" как контрольный denominator.
+    signals.applicationMarkers=0;
+    signals.queryMarkers=0;
   }else{
     signals.contractMarkers=(t.match(/Договор займа\s*\(кредита\)/gi)||[]).length;
   }
@@ -1625,10 +1650,10 @@ function creditLocalSignals(doc){
     signals.warnings.push(`Договоры: локально ${doc.contracts.length}, структурных карточек ${signals.contractMarkers}.`);
 
   if(incomplete(doc.applications.length,signals.applicationMarkers,10))
-    signals.warnings.push(`Заявки: локально ${doc.applications.length}, строк таблицы не меньше ${signals.applicationMarkers}.`);
+    signals.warnings.push(`Заявки: локально ${doc.applications.length}, строк таблицы ${signals.applicationMarkers}.`);
 
   if(incomplete(doc.queries.length,signals.queryMarkers,10))
-    signals.warnings.push(`Запросы: локально ${doc.queries.length}, строк таблицы не меньше ${signals.queryMarkers}.`);
+    signals.warnings.push(`Запросы: локально ${doc.queries.length}, строк таблицы ${signals.queryMarkers}.`);
 
   return signals;
 }
@@ -1897,61 +1922,88 @@ function creditParseScoringApplications(text){
   const start=text.search(/Сведения об обращении субъекта к источнику с предложением совершить сделку/i);
   if(start<0) return [];
 
-  // В оглавлении есть ранний заголовок запросов, поэтому используем ПОСЛЕДНИЙ раздел запросов.
   const qpos=text.lastIndexOf('СВЕДЕНИЯ О ЗАПРОСАХ КРЕДИТНОЙ ИСТОРИИ');
-  const raw=text.slice(start,qpos>start?qpos:text.length)
+  const part=text.slice(start,qpos>start?qpos:text.length)
     .replace(/\u00a0/g,' ')
     .replace(/\r/g,'');
 
-  // Старт каждой реальной строки таблицы: дата + первая часть УИД.
-  const startRe=/\b\d{2}\.\d{2}\.\d{4}\s+[0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}/g;
-  const starts=[];
-  let sm;
-  while((sm=startRe.exec(raw))) starts.push(sm.index);
+  const lines=part.split('\n');
+  const rows=[];
+  let current=null;
+
+  const flush=()=>{
+    if(current) rows.push(current);
+    current=null;
+  };
+
+  // Реальная строка таблицы начинается именно "дата + первая часть УИД".
+  const rowStart=/^\s*(\d{2}\.\d{2}\.\d{4})\s+([0-9a-fA-F]{8}-[0-9a-fA-F-]{8,})\s+(.*)$/;
+
+  for(const line of lines){
+    const m=line.match(rowStart);
+    if(m){
+      flush();
+      current={
+        date:m[1],
+        uid1:m[2],
+        firstRest:m[3]||'',
+        lines:[m[3]||'']
+      };
+    }else if(current){
+      current.lines.push(line);
+    }
+  }
+  flush();
 
   const out=[];
 
-  for(let i=0;i<starts.length;i++){
-    const row=raw.slice(starts[i],i+1<starts.length?starts[i+1]:raw.length)
-      .replace(/\s+/g,' ')
-      .trim();
+  for(const r of rows){
+    const first=(r.firstRest||'').replace(/\s+/g,' ').trim();
+    const all=r.lines.join(' ').replace(/\s+/g,' ').trim();
 
-    const dateM=row.match(/^(\d{2}\.\d{2}\.\d{4})\s+/);
-    if(!dateM) continue;
-
-    const borrowerPos=row.search(/\bЗаемщик\b/i);
+    // На первой строке таблицы кредитор расположен между первой частью УИД и "Заемщик".
+    const borrowerPos=first.search(/\bЗаемщик\b/i);
     if(borrowerPos<0) continue;
 
-    // Часть до "Заемщик" = дата + УИД (часто 2 фрагмента) + кредитор.
-    let left=row.slice(dateM[0].length,borrowerPos).trim();
+    let bankRaw=first.slice(0,borrowerPos).trim();
+    let bank=creditNormBank(bankRaw);
 
-    // Собираем УИД из первых одного/двух hex-токенов.
-    const tokens=left.split(/\s+/);
-    const uidParts=[];
-    while(tokens.length && /^[0-9a-fA-F-]{5,}$/.test(tokens[0]) && uidParts.length<2){
-      uidParts.push(tokens.shift());
+    // Если название кредитора перенесено, пытаемся добавить продолжение со следующей строки,
+    // но не хвост УИД.
+    if((bank==='Банк не определён' || bankRaw.length<4 || /(?:ранее|ООО|АО|ПАО)\s*[-–]?$/.test(bankRaw)) && r.lines.length>1){
+      let continuation=(r.lines[1]||'')
+        .replace(/^\s*[0-9a-fA-F-]{5,}\s*/,'')
+        .replace(/\s+/g,' ')
+        .trim();
+      if(continuation && !/\bЗаемщик\b/i.test(continuation)){
+        bank=creditNormBank((bankRaw+' '+continuation).trim());
+      }
     }
-    let uid=uidParts.join('').replace(/--+/g,'-');
 
-    let bankRaw=tokens.join(' ').trim();
-    const bank=creditNormBank(bankRaw);
     if(bank==='Банк не определён' || creditIsStructuralName(bank)) continue;
 
-    const rest=row.slice(borrowerPos);
-    const amountM=rest.match(/Заемщик\s+(\d[\d ]*(?:[.,]\d{2})?)\s*RUB/i);
-    const statusM=rest.match(/\b(Отказ|Выдано|Одобрено|Одобрена|На рассмотрении|Договор заключ[её]н)\b/i);
+    // Вторая часть УИД почти всегда находится в начале следующей строки.
+    let uid2='';
+    for(const ln of r.lines.slice(1,3)){
+      const um=(ln||'').match(/^\s*([0-9a-fA-F-]{5,})\b/);
+      if(um){ uid2=um[1]; break; }
+    }
+    const uid=(r.uid1+(uid2||'')).replace(/\s+/g,'').replace(/--+/g,'-').toLowerCase();
+
+    const amountM=all.match(/\bЗаемщик\s+(\d[\d ]*(?:[.,]\d{2})?)\s*RUB/i);
+    const statusM=all.match(/\b(Отказ|Выдано|Одобрено|Одобрена|На рассмотрении|Договор заключ[её]н)\b/i);
     if(!statusM) continue;
 
     out.push({
       type:'Заявка',
-      date:creditDate(dateM[1]),
+      date:creditDate(r.date),
       source:bank,
       bank,
       amount:amountM?amountM[1]:'',
       amountNum:amountM?creditMoneyNumber(amountM[1]):null,
       status:statusM[1].replace(/\s+/g,' '),
       uid,
-      bureauType:'scoring-app-v14'
+      bureauType:'scoring-app-v15'
     });
   }
 
@@ -2058,78 +2110,67 @@ function creditApplications(text){
 
 
 function creditParseOkbBlocks(text){
-  const marker='Общие сведения о сделке';
-  const positions=[];
-  let p=0;
-  while((p=text.indexOf(marker,p))>=0){
-    positions.push(p);
-    p+=marker.length;
+  // Реальный отчёт ОКБ содержит по одной строке:
+  // "1. ФИНАНСОВЫЙ СУПЕРМАРКЕТ ООО МКК - Договор займа (кредита) - Необеспеченный микрозаем"
+  // на каждую карточку. Используем именно эти строки как границы блоков.
+  const headRe=/^\s*(\d{1,3})\.\s*(.*?)\s*-\s*Договор займа\s*\(кредита\)\s*-\s*(.*?)\s*$/gmi;
+  const heads=[];
+  let hm;
+
+  while((hm=headRe.exec(text))){
+    const bank=creditNormBank((hm[2]||'').replace(/\s+/g,' ').trim());
+    if(bank==='Банк не определён' || creditIsStructuralName(bank)) continue;
+
+    heads.push({
+      index:hm.index,
+      end:headRe.lastIndex,
+      ordinal:Number(hm[1]),
+      bank,
+      product:(hm[3]||'').replace(/\s+/g,' ').trim()
+    });
   }
 
   const out=[];
 
-  for(let i=0;i<positions.length;i++){
-    const pos=positions[i];
-    const prev=i?positions[i-1]+marker.length:0;
-    const next=i+1<positions.length?positions[i+1]:text.length;
+  for(let i=0;i<heads.length;i++){
+    const h=heads[i];
+    const end=i+1<heads.length?heads[i+1].index:text.length;
+    const block=text.slice(h.index,end);
 
-    // Источник и сумма расположены непосредственно ПЕРЕД "Общие сведения о сделке".
-    const before=text.slice(Math.max(prev,pos-9000),pos);
-    const after=text.slice(pos,Math.min(next,pos+18000));
-    const block=before+marker+after;
-
-    // Название источника: берём последнее значение перед "Заимодавец".
-    // Это устойчивее заголовков колонок "Сокращенное наименование..." PDF.
-    let bankRaw='';
-    const sourceMatches=[...before.matchAll(/([А-ЯA-ZЁ0-9"'«»().\- _]{2,180})\s+Заимодавец\s*[–-]\s*(?:микрофинансовая|кредитная|иная)/gi)];
-    if(sourceMatches.length){
-      bankRaw=(sourceMatches[sourceMatches.length-1][1]||'').replace(/\s+/g,' ').trim();
-      // Заголовок таблицы иногда попадает в начало capture — оставляем последнюю строкоподобную часть.
-      bankRaw=bankRaw.replace(/^.*(?:Дата создания источника|ОГРН(?:ИП)?|ИНН)\s+/i,'').trim();
-    }
-
-    // Резерв для банков: перед "Кредитор – кредитная организация".
-    if(!bankRaw){
-      const bankMatches=[...before.matchAll(/([А-ЯA-ZЁ0-9"'«»().\- _]{2,180})\s+(?:Кредитор|Заимодавец)\s*[–-]\s*кредитная организация/gi)];
-      if(bankMatches.length) bankRaw=(bankMatches[bankMatches.length-1][1]||'').replace(/\s+/g,' ').trim();
-    }
-
-    const bank=creditNormBank(bankRaw);
-    if(bank==='Банк не определён' || creditIsStructuralName(bank)) continue;
-
-    // Сумма — последнее значение после заголовка "Сумма и валюта обязательства" перед карточкой.
-    let amountNum=null, amount='';
-    const amountZonePos=before.lastIndexOf('Сумма и валюта обязательства');
-    if(amountZonePos>=0){
-      const az=before.slice(amountZonePos);
-      const am=az.match(/(\d[\d \u00A0]*(?:[.,]\d{1,2})?)\s*р\./i);
-      if(am){
-        amount=am[1].replace(/\s+/g,' ').trim();
-        amountNum=creditMoneyNumber(am[1]);
-      }
-    }
-
-    // После marker таблица начинается с Вид участия / Идентификатор сделки / Номер сделки.
-    const uidM=after.match(/За[её]мщик\s+([0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})/i)
-      || after.match(/Идентификатор сделки[\s\S]{0,220}?([0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})/i);
-
-    const dateM=after.match(/Дата совершения сделки[\s\S]{0,260}?(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
+    const dateM=block.match(
+      /Дата совершения сделки[\s\S]{0,900}?(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i
+    );
     if(!dateM) continue;
+
     const dealDate=creditDate(dateM[1]);
     if(!dealDate) continue;
 
+    const amountM=block.match(
+      /Сумма и валюта обязательства[\s\S]{0,900}?(\d[\d \u00A0]*(?:[.,]\d{1,2})?)\s*р\./i
+    );
+
+    // В ОКБ "Идентификатор сделки" соответствует УИД из Скоринг Бюро.
+    const uidM=block.match(
+      /Идентификатор сделки[\s\S]{0,700}?([0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})/i
+    );
+
     let contract='';
-    const numM=after.match(/Номер сделки[\s\S]{0,220}?За[её]мщик\s+[0-9a-fA-F-]{20,}\s+([^\n\r]{1,100})/i);
+    const numM=block.match(/Номер сделки[\s\S]{0,500}?([A-Za-zА-Яа-я0-9._\/-]{2,100})/i);
     if(numM){
-      const n=(numM[1]||'').replace(/\s+/g,' ').trim();
-      if(n && n!=='-') contract=n;
+      const n=(numM[1]||'').trim();
+      if(n && n!=='-' && !/^Дата$/i.test(n)) contract=n;
     }
 
-    const actualEndM=block.match(/Дата фактического прекращения обязательства\s*(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
-    const paidM=block.match(/Сумма всех внесенных платежей[\s\S]{0,320}?По обязательству\s*(\d[\d \u00A0]*(?:[.,]\d{1,2})?)\s*р\./i);
+    const actualEndM=block.match(
+      /Дата фактического прекращения обязательства[\s\S]{0,500}?(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i
+    );
+
+    const paidM=block.match(
+      /Сумма всех внесенных платежей[\s\S]{0,500}?По обязательству\s*(\d[\d \u00A0]*(?:[.,]\d{1,2})?)\s*р\./i
+    );
 
     const overdueDates=[];
-    const odRe=/Просроченная[\s\S]{0,420}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/gi;
+    const odRe=/Просроченная[\s\S]{0,500}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/gi;
     let od;
     while((od=odRe.exec(block))){
       const d=creditDate(od[1]);
@@ -2142,24 +2183,23 @@ function creditParseOkbBlocks(text){
     out.push({
       type:'Договор',
       date:dealDate,
-      bank,
-      source:bank,
-      amountNum,
-      amount,
+      bank:h.bank,
+      source:h.bank,
+      amountNum:amountM?creditMoneyNumber(amountM[1]):null,
+      amount:amountM?(amountM[1]||'').replace(/\s+/g,' ').trim():'',
       status:actualEnd?'Закрыт':'Действует',
       contract,
-      uid:uidM?(uidM[1]||'').trim():'',
-      product:'Договор займа (кредита)',
+      uid:uidM?(uidM[1]||'').replace(/\s+/g,'').toLowerCase():'',
+      product:h.product,
       overdueDate:overdueDates.length?overdueDates[0]:null,
       actualEndDate:actualEnd,
       paidTotal:paidM?creditMoneyNumber(paidM[1]):null,
-      bureauType:'okb-block-v14',
-      okbOrdinal:i+1
+      bureauType:'okb-heading-v15',
+      okbOrdinal:h.ordinal
     });
   }
 
-  // В отчёте ОКБ каждый marker "Общие сведения о сделке" — отдельная карточка.
-  // Никакой soft-дедупликации внутри бюро.
+  // Внутри одного ОКБ карточки не склеиваем.
   return out;
 }
 
