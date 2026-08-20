@@ -828,7 +828,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v10 hybrid: локальный парсер + AI-fallback для нераспознанных блоков Скоринг Бюро + объединение одинаковых договоров между БКИ. AI не используется как единственный источник и не должен додумывать отсутствующие данные.</div>
+<div class="analyzer-note">v10.1 hybrid: локальный парсер + AI-fallback для нераспознанных блоков Скоринг Бюро + объединение одинаковых договоров между БКИ. AI не используется как единственный источник и не должен додумывать отсутствующие данные.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1315,19 +1315,58 @@ function creditParseScoringContracts(text){
 }
 
 async function creditAiAnalyzeBlock(block,bureau='Скоринг Бюро'){
-  const response=await fetch('https://dolgnavigator.vercel.app/api/analyze-bki',{
+  const response=await fetch('/api/analyze-bki',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({bureau,text:block.slice(0,48000)})
   });
+
   const data=await response.json().catch(()=>({}));
-  if(!response.ok) throw new Error(data?.error||('AI API '+response.status));
+
+  if(!response.ok){
+    console.error('AI FALLBACK API ERROR',{
+      bureau,
+      status:response.status,
+      block:block.slice(0,3000),
+      response:data
+    });
+    throw new Error(data?.error||('AI API '+response.status));
+  }
+
   const rows=Array.isArray(data?.result?.contracts)?data.result.contracts:[];
-  return rows.map(c=>({
-    type:'Договор',date:creditDate(c.contract_date||''),bank:creditNormBank(c.creditor||''),source:creditNormBank(c.creditor||''),
-    amountNum:creditMoneyNumber(c.amount),amount:c.amount==null?'':String(c.amount),status:c.status||'',
-    contract:c.contract_id||'',uid:c.uid||'',product:'',overdueDate:creditDate(c.first_overdue_date||''),
-    maxOverdueDays:null,paidTotal:creditMoneyNumber(c.paid_total),actualEndDate:null,bureauType:'ai-fallback',aiRecovered:true
-  })).filter(x=>x.date && x.bank!=='Банк не определён');
+
+  const mapped=rows.map(c=>({
+    type:'Договор',
+    date:creditDate(c.contract_date||''),
+    bank:creditNormBank(c.creditor||''),
+    source:creditNormBank(c.creditor||''),
+    amountNum:creditMoneyNumber(c.amount),
+    amount:c.amount==null?'':String(c.amount),
+    status:c.status||'',
+    contract:c.contract_id||'',
+    uid:c.uid||'',
+    product:'',
+    overdueDate:creditDate(c.first_overdue_date||''),
+    maxOverdueDays:null,
+    paidTotal:creditMoneyNumber(c.paid_total),
+    actualEndDate:null,
+    bureauType:'ai-fallback',
+    aiRecovered:true
+  }));
+
+  const accepted=mapped.filter(x=>x.date && x.bank!=='Банк не определён');
+
+  console.groupCollapsed('AI FALLBACK RESPONSE · '+bureau+' · найдено '+rows.length+' · принято '+accepted.length);
+  console.log('Исходный блок Скоринг Бюро:',block.slice(0,3000));
+  console.log('Полный ответ API:',data);
+  console.log('Договоры от AI:',rows);
+  console.log('После преобразования:',mapped);
+  console.log('Принято в парсер:',accepted);
+  if(rows.length && !accepted.length){
+    console.warn('AI вернул договоры, но они были отфильтрованы. Проверьте contract_date и creditor.',mapped);
+  }
+  console.groupEnd();
+
+  return accepted;
 }
 function creditScoringUnresolvedBlocks(text,parsed){
   const keys=new Set(parsed.map(x=>creditFmt(x.date)+'|'+creditNormBank(x.bank)+'|'+Math.round(x.amountNum||0)));
