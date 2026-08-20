@@ -1,161 +1,146 @@
 export default async function handler(req, res) {
-  // Разрешаем запросы из браузера / Telegram Mini App
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Предварительный CORS-запрос браузера
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  // Сам API должен принимать только POST
-  if (req.method !== "POST") {
-    return res.status(405).json({
-      error: "Method not allowed"
-    });
-  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
     const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
 
-    if (!apiKey) {
-      return res.status(500).json({
-        error: "OPENAI_API_KEY is not configured"
-      });
-    }
-
-    const { bureau, text } = req.body || {};
-
+    const { bureau, text, kind = "contracts", meta = {} } = req.body || {};
     if (!text || typeof text !== "string") {
-      return res.status(400).json({
-        error: "Field 'text' is required"
-      });
+      return res.status(400).json({ error: "Field 'text' is required" });
     }
 
-    const prompt = `
-Ты анализируешь фрагмент российского кредитного отчета БКИ.
-
-Бюро: ${bureau || "не определено"}
-
-Задача:
-
-1. Найди только реальные кредитные договоры.
-2. Не считай заголовки страниц, номера разделов и служебный текст кредиторами.
-3. Не путай заявку на кредит с фактически заключенным договором.
-4. Не путай отказ в выдаче кредита с договором.
-5. Если в одном фрагменте несколько договоров — верни каждый отдельно.
-6. Ничего не выдумывай.
-7. Если значение поля отсутствует в тексте — верни null.
-
-Для каждого договора извлеки:
-
-- creditor
-- contract_date
-- amount
-- currency
-- contract_id
-- uid
-- status
-- first_overdue_date
-- paid_total
-
-Верни ТОЛЬКО валидный JSON без пояснений и markdown.
-
-Формат:
-
-{
-  "contracts": [
-    {
-      "creditor": "string",
-      "contract_date": "YYYY-MM-DD или null",
-      "amount": 0,
-      "currency": "RUB",
-      "contract_id": "string или null",
-      "uid": "string или null",
-      "status": "string или null",
-      "first_overdue_date": "YYYY-MM-DD или null",
-      "paid_total": 0
-    }
-  ],
-  "warnings": []
-}
-
-Фрагмент отчета:
-
-${text.slice(0, 50000)}
+    const base = `
+Ты проверяешь фрагмент российского кредитного отчета БКИ.
+Бюро: ${bureau || "не определено"}.
+Ничего не выдумывай. Используй только явно присутствующие в тексте данные.
+Если значение отсутствует — null. Не превращай заголовки таблиц, служебный текст и примеры в реальные записи.
 `;
 
-    const response = await fetch(
-      "https://api.openai.com/v1/responses",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: "gpt-5.6-luna",
-          input: prompt
-        })
-      }
-    );
+    let task = "";
+
+    if (kind === "applications") {
+      task = `
+Найди только реальные кредитные обращения/заявки в этом фрагменте.
+Не считай запрос кредитной истории заявкой.
+Не считай договор заявкой, если нет отдельной записи об обращении.
+Верни ТОЛЬКО JSON:
+{
+  "applications": [{
+    "creditor": "string",
+    "application_date": "YYYY-MM-DD или null",
+    "amount": 0,
+    "currency": "RUB или null",
+    "uid": "string или null",
+    "status": "Отказ/Выдано/Одобрено/иное или null"
+  }],
+  "warnings": []
+}`;
+    } else if (kind === "queries") {
+      task = `
+Найди только реальные запросы кредитной истории/обращения пользователей БКИ в этом фрагменте.
+Не считай кредитную заявку запросом БКИ.
+Верни ТОЛЬКО JSON:
+{
+  "queries": [{
+    "requester": "string",
+    "query_date": "YYYY-MM-DD или null",
+    "purpose": "string или null",
+    "amount": 0
+  }],
+  "warnings": []
+}`;
+    } else if (kind === "quality") {
+      task = `
+Это КОНТРОЛЬ КАЧЕСТВА локального парсера, а не полный повторный разбор отчета.
+Локальный результат и сигналы:
+${JSON.stringify(meta).slice(0,8000)}
+
+Проверь, противоречат ли видимые в этом фрагменте заголовки/сводные показатели/структура отчета локальным результатам.
+Не делай вывод по невидимой части файла.
+Верни ТОЛЬКО JSON:
+{
+  "verdict": "ok|warning|parser_anomaly",
+  "warnings": ["конкретное наблюдение"],
+  "observed": {
+    "contracts_hint": 0,
+    "applications_hint": 0,
+    "queries_hint": 0
+  }
+}`;
+    } else {
+      task = `
+Найди только реальные кредитные договоры.
+Не считай заявки, отказы и запросы кредитной истории договорами.
+Для каждого договора извлеки:
+creditor, contract_date, amount, currency, contract_id, uid, status,
+first_overdue_date, paid_total, actual_end_date, product.
+Верни ТОЛЬКО JSON:
+{
+  "contracts": [{
+    "creditor": "string",
+    "contract_date": "YYYY-MM-DD или null",
+    "amount": 0,
+    "currency": "RUB или null",
+    "contract_id": "string или null",
+    "uid": "string или null",
+    "status": "string или null",
+    "first_overdue_date": "YYYY-MM-DD или null",
+    "paid_total": 0,
+    "actual_end_date": "YYYY-MM-DD или null",
+    "product": "string или null"
+  }],
+  "warnings": []
+}`;
+    }
+
+    const prompt = `${base}\n${task}\n\nФрагмент отчета:\n${text.slice(0,50000)}`;
+
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-luna",
+        input: prompt
+      })
+    });
 
     const data = await response.json();
 
     if (!response.ok) {
       console.error("OpenAI API error:", data);
-
-      return res.status(response.status).json({
-        error: "OpenAI API error",
-        details: data
-      });
+      return res.status(response.status).json({ error: "OpenAI API error", details: data });
     }
 
     const outputText =
-      data.output
-        ?.flatMap(item => item.content || [])
-        ?.find(item => item.type === "output_text")
-        ?.text || "";
+      data.output?.flatMap(item => item.content || [])
+        ?.find(item => item.type === "output_text")?.text || "";
 
     let parsed;
-
     try {
-      const cleaned = outputText
-        .replace(/^```json\s*/i, "")
-        .replace(/^```\s*/i, "")
-        .replace(/```$/i, "")
-        .trim();
-
-      parsed = JSON.parse(cleaned);
-    } catch (error) {
-      console.error("Invalid AI JSON:", outputText);
-
-      return res.status(502).json({
-        error: "AI returned invalid JSON",
-        raw: outputText
-      });
-    }
-
-    if (!parsed || !Array.isArray(parsed.contracts)) {
-      parsed = {
-        contracts: [],
-        warnings: ["AI response did not contain contracts array"]
-      };
+      parsed = JSON.parse(
+        outputText.replace(/^```json\s*/i,"").replace(/^```\s*/i,"").replace(/```$/i,"").trim()
+      );
+    } catch {
+      return res.status(502).json({ error: "AI returned invalid JSON", raw: outputText });
     }
 
     return res.status(200).json({
       ok: true,
       bureau: bureau || null,
+      kind,
       result: parsed
     });
-
   } catch (error) {
     console.error("Internal server error:", error);
-
-    return res.status(500).json({
-      error: "Internal server error",
-      message: error?.message || String(error)
-    });
+    return res.status(500).json({ error: "Internal server error", message: error?.message || String(error) });
   }
 }
