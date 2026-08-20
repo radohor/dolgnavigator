@@ -24,7 +24,73 @@ export default async function handler(req, res) {
 
     let task = "";
 
-    if (kind === "applications") {
+    if (kind === "full_extract") {
+      task = `
+Ты являешься ОСНОВНЫМ парсером российского кредитного отчета БКИ.
+Перед тобой фрагмент отчета с маркерами страниц вида [[PAGE 123]].
+
+Нужно извлечь ВСЕ реальные записи, полностью содержащиеся или начинающиеся в этом фрагменте:
+1. Кредитные договоры.
+2. Кредитные заявления/обращения, включая отказанные.
+3. Запросы кредитной истории.
+
+КРИТИЧЕСКИЕ ПРАВИЛА:
+- Не путай договор, заявку и запрос БКИ.
+- Не превращай заголовки, итоги, легенды таблиц и служебный текст в записи.
+- Если одна запись переносится между строками, собери ее целиком.
+- Если название кредитора перенесено на несколько строк, собери полное название, а не "ООО", "АО" или "Общество с ограниченной".
+- Для УИД собери ВСЕ части, даже если УИД перенесен между строками/колонками.
+- Если запись началась до первой страницы фрагмента и здесь виден только хвост, не создавай ее повторно.
+- Если запись начинается на последней странице фрагмента и продолжается дальше, извлеки то, что достоверно видно; неизвестные поля оставь null.
+- Ничего не выдумывай.
+- source_page — номер страницы из ближайшего маркера [[PAGE N]], где начинается запись.
+- evidence — короткая опорная фраза из источника, не более 12 слов.
+- confidence: "high", "medium" или "low".
+- Верни ТОЛЬКО валидный JSON без markdown.
+
+Формат:
+{
+  "contracts": [{
+    "creditor": "полное название кредитора или null",
+    "contract_date": "YYYY-MM-DD или null",
+    "amount": 0,
+    "currency": "RUB или null",
+    "contract_id": "string или null",
+    "uid": "полный УИД или null",
+    "status": "string или null",
+    "product": "string или null",
+    "first_overdue_date": "YYYY-MM-DD или null",
+    "max_overdue_days": 0,
+    "paid_total": 0,
+    "actual_end_date": "YYYY-MM-DD или null",
+    "termination_basis": "string или null",
+    "source_page": 0,
+    "confidence": "high|medium|low",
+    "evidence": "string"
+  }],
+  "applications": [{
+    "creditor": "полное название кредитора или null",
+    "application_date": "YYYY-MM-DD или null",
+    "amount": 0,
+    "currency": "RUB или null",
+    "uid": "полный УИД обращения или null",
+    "status": "Отказ|Выдано|Одобрено|На рассмотрении|иное",
+    "source_page": 0,
+    "confidence": "high|medium|low",
+    "evidence": "string"
+  }],
+  "queries": [{
+    "requester": "полное название пользователя кредитной истории или null",
+    "query_date": "YYYY-MM-DD или null",
+    "purpose": "string или null",
+    "amount": 0,
+    "source_page": 0,
+    "confidence": "high|medium|low",
+    "evidence": "string"
+  }],
+  "warnings": []
+}`;
+    } else if (kind === "applications") {
       task = `
 Найди только реальные кредитные обращения/заявки в этом фрагменте.
 Не считай запрос кредитной истории заявкой.
@@ -99,7 +165,7 @@ first_overdue_date, paid_total, actual_end_date, product.
 }`;
     }
 
-    const prompt = `${base}\n${task}\n\nФрагмент отчета:\n${text.slice(0,50000)}`;
+    const prompt = `${base}\n${task}\n\nФрагмент отчета:\n${text.slice(0,65000)}`;
 
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
