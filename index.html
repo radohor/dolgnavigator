@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v20 indexed AI: AI получает только проблемные структурные записи, но теперь каждая запись имеет обязательный item_index. Модель обязана вернуть результат по каждому входному item_index; пустой ответ или пропуск фиксируется как ошибка покрытия, а не как успешный AI-вызов. Пакеты укрупнены для сокращения времени анализа.</div>
+<div class="analyzer-note">v21 working core: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ и Скоринг распознаются отдельными адаптерами, договоры объединяются по точному УИД.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -3331,17 +3331,8 @@ function creditRenderResult(docs){
       return details;
     }).join('');
 
-  const aiFirstProblems=docs.flatMap(d=>
-    (d.selectiveAi?.verdict&&d.selectiveAi.verdict!=='complete')
-      ? [`${d.bureau}: ${(d.selectiveAi?.anomalies||[]).join(', ')}`]
-      : []
-  );
-  const aiQualityGateHtml=aiFirstProblems.length?`
-    <div class="finding-card risk">
-      <h4>Indexed AI обнаружил неполный разбор БКИ</h4>
-      <p>${aiFirstProblems.map(escapeHtml).join('<br>')}</p>
-      <p><b>Юридический вывод ниже считается предварительным до повторной проверки проблемного раздела.</b></p>
-    </div>`:'';
+  const parserWarnings=docs.flatMap(d=>(d.parserCore?.warnings||[]).map(w=>`${d.bureau}: ${w}`));
+  const aiQualityGateHtml=parserWarnings.length?`<div class="quality-warn"><b>Ограничение текущей версии:</b><br>${parserWarnings.map(escapeHtml).join('<br>')}</div>`:'';
 
   const mergeAuditHtml=mergeAudit?`
     <div class="source-card" style="margin-top:12px">
@@ -3359,11 +3350,12 @@ function creditRenderResult(docs){
     const open=dc.filter(c=>/действ|открыт/i.test(c.status||'')).length;
     const closed=dc.filter(c=>/закрыт|прекращ/i.test(c.status||'')).length;
     const rej=d.applications.filter(a=>/отказ/i.test(a.status||'')).length;
-    const af=d.selectiveAi;
-    const sig=af?.signals||creditLocalSignals(d);
-    const aiLine=af?`<div style="margin-top:8px;font-size:12px;color:${af.verdict==='complete'?'#607077':'#9a3412'}"><b>Indexed AI:</b> ${escapeHtml(af.verdict||'')} · AI-вызовов ${af.calls||0} · ошибок ${af.failures||0}${af.coverage?' · покрытие '+af.coverage.returned+'/'+af.coverage.expected:''}</div>`:'';
-    const qcLine=af?`<div style="margin-top:3px;font-size:11px;color:#607077">Структурный контроль: договоры ${dc.length}/${sig.contractMarkers||'—'} · заявки ${d.applications.length}/${sig.applicationMarkers||'—'} · запросы ${d.queries.length}/${sig.queryMarkers||'—'}</div>`:'';
-    const qcWarn=af?.anomalies?.length?`<div style="margin-top:4px;font-size:12px;color:#8a5a00">${af.anomalies.map(w=>escapeHtml(w)).join(' · ')}</div>`:'';
+    const pc=d.parserCore||{};
+    const meta=pc.meta||{};
+    const verified=(meta.sections_verified||[]).join(', ');
+    const aiLine=`<div style="margin-top:8px;font-size:12px;color:#607077"><b>Python parser:</b> OK${verified?' · проверено: '+escapeHtml(verified):''}</div>`;
+    const qcLine=`<div style="margin-top:3px;font-size:11px;color:#607077">УИД: ${meta.uid_unique??meta.contract_uid_map_count??'—'} · договоров ${dc.length} · заявок ${d.applications.length} · запросов ${d.queries.length}</div>`;
+    const qcWarn=(pc.warnings||[]).length?`<div style="margin-top:4px;font-size:12px;color:#8a5a00">${pc.warnings.map(w=>escapeHtml(w)).join(' · ')}</div>`:'';
     return `<div class="source-card">
       <div class="source-head"><div><h4>${escapeHtml(d.bureau)}</h4><span>${d.numPages} стр. · ${escapeHtml(d.name)}</span></div></div>
       <div class="source-metrics">
@@ -3420,7 +3412,7 @@ function creditRenderResult(docs){
 
     <div class="merge-card">
       <h3>После объединения БКИ</h3>
-      <p>Код читает стабильные разделы локально. AI получает только проблемные структурные строки и карточки, после чего код проверяет полноту и объединяет данные между БКИ. Основное объединение договоров между БКИ выполняется детерминированно по точному УИД, затем по ID договора. Мягкое сопоставление допускается только для взаимно-однозначных пар без конфликта УИД.</p>
+      <p>Оба отчёта разбираются серверным Python-ядром без GPT. Договоры между БКИ объединяются детерминированно: сначала по точному УИД; мягкое сопоставление допускается только без конфликта УИД.</p>
       <div class="merge-pills">
         <span class="merge-pill">Уникальных договоров: ${loans.length}</span>
         <span class="merge-pill">Подтверждены 2+ БКИ: ${confirmed2}</span>
@@ -3459,7 +3451,7 @@ function creditRenderResult(docs){
       </div>
     </div>
 
-    <div class="cta15"><div>${aiQualityGateHtml}<h3>После проверки парсера — юридический слой</h3><p>Доход, анкеты банков, обстоятельства прекращения платежей, имущество и сделки подключаем только после того, как договоры и источники стабильно распознаются.</p></div><button class="btn primary" type="button" onclick="startFlow('full')">Продолжить проверку</button></div>
+    <div class="cta15"><div>${aiQualityGateHtml}<h3>Следующий этап — юридический анализ</h3><p>Парсер БКИ отделён от юридического AI. На следующем этапе к структурированным данным подключаются анкеты, доход, обстоятельства прекращения платежей, имущество и сделки.</p></div><button class="btn primary" type="button" onclick="startFlow('full')">Продолжить проверку</button></div>
   `;
 
   document.getElementById('creditTechToggle')?.addEventListener('click',()=>{
@@ -3469,44 +3461,98 @@ function creditRenderResult(docs){
   });
 }
 
+
+function creditApiNormalizeDoc(data,file){
+  const contracts=(data.contracts||[]).map(c=>({
+    type:'Договор',
+    bank:creditNormBank(c.creditor||''),
+    source:c.creditor||'',
+    date:creditDate(c.contract_date||c.start_date||c.obligation_start_date||''),
+    amountNum:creditMoneyNumber(c.amount),
+    amount:c.amount||'',
+    uid:String(c.uid||'').trim().toLowerCase(),
+    contract:c.contract_id||c.uid||'',
+    status:c.status_section||'',
+    product:c.product||(Array.isArray(c.creditor_type_raw)?c.creditor_type_raw.slice(-2).join(' '):''),
+    overdueDate:null,
+    paidTotal:null,
+    bureauType:'python-v21'
+  })).filter(c=>c.date);
+
+  const applications=(data.applications||[]).map(a=>({
+    type:'Заявка',
+    bank:creditNormBank(a.creditor||''),
+    source:a.creditor||'',
+    date:creditDate(a.application_date||''),
+    amountNum:creditMoneyNumber(a.amount),
+    amount:a.amount||'',
+    uid:String(a.uid||'').trim().toLowerCase(),
+    status:String(a.status||'').trim(),
+    method:a.method||'',
+    warning:a.warning||'',
+    bureauType:'python-v21'
+  })).filter(a=>a.date);
+
+  const queries=(data.queries||[]).map(q=>({
+    type:'Запрос БКИ',
+    bank:creditNormBank(q.requester||''),
+    source:q.requester||'',
+    date:creditDate(q.query_date||''),
+    amountNum:creditMoneyNumber(q.amount),
+    amount:q.amount||'',
+    purpose:q.purpose||q.requested_info||'',
+    status:'',
+    warning:q.warning||'',
+    bureauType:'python-v21'
+  })).filter(q=>q.date);
+
+  return {
+    name:file.name,
+    numPages:data.page_count||0,
+    bureau:data.bureau||'Не определено',
+    contracts, applications, queries,
+    parserCore:{ok:true,counts:data.counts||{},meta:data.meta||{},warnings:data.warnings||[]}
+  };
+}
+
+async function creditParseViaServer(file){
+  if(file.size>4300000){
+    throw new Error(`${file.name}: файл ${(file.size/1024/1024).toFixed(1)} МБ, а прямой запрос в Vercel ограничен примерно 4,5 МБ.`);
+  }
+  const r=await fetch('/api/parse-bki',{
+    method:'POST',
+    headers:{'Content-Type':'application/pdf','X-Filename':encodeURIComponent(file.name)},
+    body:file
+  });
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok||!data.ok) throw new Error(data.error||data.detail||`Ошибка сервера ${r.status}`);
+  return creditApiNormalizeDoc(data,file);
+}
+
 async function creditRun(){
   if(!creditFiles.length) return;
-
   const btn=document.getElementById('creditAnalyzeBtn');
   btn.disabled=true;
-  btn.textContent='Читаю PDF…';
+  btn.textContent='Разбираю БКИ…';
   document.getElementById('creditResults').innerHTML='';
-  creditSetProgress(2);
-
+  creditSetProgress(5);
   try{
     const docs=[];
-
     for(let i=0;i<creditFiles.length;i++){
-      btn.textContent=`Извлекаю текст PDF ${i+1}/${creditFiles.length}…`;
-      const extracted=await creditExtract(creditFiles[i],i,creditFiles.length);
-
-      btn.textContent=`AI читает только проблемные разделы ${i+1}/${creditFiles.length}…`;
-
-      const analyzed=await creditSelectiveAnalyzeDoc(extracted,(done,total)=>{
-        btn.textContent=`AI: ${done}/${total} пакетов`;
-        creditSetProgress(Math.min(96,40 + (i/creditFiles.length)*50 + (done/Math.max(1,total))*(50/creditFiles.length)));
-      });
-
-      docs.push(analyzed);
+      btn.textContent=`Разбираю БКИ ${i+1}/${creditFiles.length}…`;
+      creditSetProgress(10+(i/creditFiles.length)*80);
+      docs.push(await creditParseViaServer(creditFiles[i]));
+      creditSetProgress(10+((i+1)/creditFiles.length)*80);
     }
-
-    creditSetProgress(100);
+    btn.textContent='Объединяю данные…';
+    creditSetProgress(95);
     creditRenderResult(docs);
-
+    creditSetProgress(100);
     btn.disabled=false;
     btn.textContent='Анализировать заново';
   }catch(err){
     console.error(err);
-    document.getElementById('creditResults').innerHTML=
-      `<div class="finding-card risk">
-        <h4>Не удалось проанализировать БКИ</h4>
-        <p>${escapeHtml(err.message||String(err))}</p>
-      </div>`;
+    document.getElementById('creditResults').innerHTML=`<div class="finding-card risk"><h4>Не удалось обработать БКИ</h4><p>${escapeHtml(err.message||String(err))}</p></div>`;
     btn.disabled=false;
     btn.textContent='Попробовать снова';
   }
