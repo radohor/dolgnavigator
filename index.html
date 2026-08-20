@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v10.4 hybrid: каждый блок «Договор №…» Скоринг Бюро сохраняется отдельно без внутренней склейки. Объединение выполняется только между разными БКИ. AI-fallback используется только для неполных блоков.</div>
+<div class="analyzer-note">v10.5 hybrid: договоры внутри одного БКИ никогда не склеиваются между собой. UID/ID и мягкое сопоставление используются только между разными БКИ. AI-fallback применяется только для неполных блоков.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1662,11 +1662,26 @@ function creditAnalyzeDoc(doc){
 }
 
 function creditDedupLoans(docs){
-  const all=docs.flatMap((d,docIndex)=>d.contracts.map((c,rowIndex)=>({...c,bureau:d.bureau,_docIndex:docIndex,_rowIndex:rowIndex})))
-    .filter(x=>x.date && creditNormBank(x.bank||x.source)!=='Банк не определён' && !creditIsStructuralName(x.bank||x.source));
+  const all=docs.flatMap((d,docIndex)=>d.contracts.map((c,rowIndex)=>({
+    ...c,
+    bureau:d.bureau,
+    _docIndex:docIndex,
+    _rowIndex:rowIndex
+  }))).filter(x=>
+    x.date &&
+    creditNormBank(x.bank||x.source)!=='Банк не определён' &&
+    !creditIsStructuralName(x.bank||x.source)
+  );
 
-  const quality=x=>(x.uid?10:0)+(x.contract?5:0)+(x.amountNum?3:0)+(x.overdueDate?3:0)+(x.paidTotal?2:0);
+  const quality=x=>
+    (x.uid?10:0)+
+    (x.contract?5:0)+
+    (x.amountNum?3:0)+
+    (x.overdueDate?3:0)+
+    (x.paidTotal?2:0);
+
   all.sort((a,b)=>quality(b)-quality(a));
+
   const groups=[];
 
   const amountCompatible=(a,b)=>{
@@ -1686,22 +1701,36 @@ function creditDedupLoans(docs){
     const bank=creditNormBank(c.bank||c.source);
     const uid=String(c.uid||'').trim();
     const contract=String(c.contract||'').trim();
+
     let existing=null;
 
-    // 1. Самый надёжный ключ — УИД.
+    // КРИТИЧЕСКОЕ ПРАВИЛО v10.5:
+    // договоры из одного и того же БКИ никогда не объединяем между собой.
+    // Ни по UID, ни по ID, ни по банку/дате/сумме.
+    const crossBkiGroups=groups.filter(g=>
+      !(g.sources||[]).includes(c.bureau)
+    );
+
+    // 1. UID — только между разными БКИ.
     if(uid){
-      existing=groups.find(g=>g.uid && String(g.uid).trim()===uid) || null;
+      existing=crossBkiGroups.find(g=>
+        g.uid &&
+        String(g.uid).trim()===uid
+      ) || null;
     }
 
-    // 2. Затем ID договора + совместимый кредитор.
+    // 2. ID договора — только между разными БКИ.
     if(!existing && contract){
-      existing=groups.find(g=>g.contract && String(g.contract).trim()===contract && creditBankSimilar(bank,g.bank)) || null;
+      existing=crossBkiGroups.find(g=>
+        g.contract &&
+        String(g.contract).trim()===contract &&
+        creditBankSimilar(bank,g.bank)
+      ) || null;
     }
 
-    // 3. Мягкое сопоставление разрешено ТОЛЬКО между разными БКИ.
+    // 3. Мягкое сопоставление — также только между разными БКИ.
     if(!existing){
-      let candidates=groups.filter(g=>{
-        if((g.sources||[]).includes(c.bureau)) return false;
+      const candidates=crossBkiGroups.filter(g=>{
         if(!creditBankSimilar(bank,g.bank)) return false;
         if(creditAbsDays(g.date,c.date)>1) return false;
         if(!amountCompatible(c.amountNum,g.amountNum)) return false;
@@ -1709,27 +1738,61 @@ function creditDedupLoans(docs){
         return true;
       });
 
-      // Если у одной стороны отсутствует сумма, не выбираем произвольно из нескольких
-      // договоров одного кредитора на ту же дату (например, два Сбербанка в один день).
+      // Если суммы нет у текущего договора — объединяем только при одном
+      // однозначном кандидате в другом БКИ.
       if(!c.amountNum){
-        if(candidates.length===1) existing=candidates[0];
+        if(candidates.length===1){
+          existing=candidates[0];
+        }
       }else{
         const withKnownAmount=candidates.filter(g=>g.amountNum);
-        if(withKnownAmount.length===1) existing=withKnownAmount[0];
-        else if(withKnownAmount.length===0 && candidates.length===1) existing=candidates[0];
+
+        if(withKnownAmount.length===1){
+          existing=withKnownAmount[0];
+        }else if(withKnownAmount.length===0 && candidates.length===1){
+          existing=candidates[0];
+        }
       }
     }
 
     if(existing){
-      existing.sources=[...new Set([...(existing.sources||[]),c.bureau])];
+      existing.sources=[...new Set([
+        ...(existing.sources||[]),
+        c.bureau
+      ])];
       existing.sourceCount=existing.sources.length;
-      for(const f of ['uid','contract','amountNum','amount','overdueDate','maxOverdueDays','paidTotal','actualEndDate','status','product','terminationBasis']){
-        if((existing[f]==null||existing[f]==='') && c[f]!=null && c[f]!=='') existing[f]=c[f];
+
+      for(const f of [
+        'uid',
+        'contract',
+        'amountNum',
+        'amount',
+        'overdueDate',
+        'maxOverdueDays',
+        'paidTotal',
+        'actualEndDate',
+        'status',
+        'product',
+        'terminationBasis'
+      ]){
+        if(
+          (existing[f]==null || existing[f]==='') &&
+          c[f]!=null &&
+          c[f]!==''
+        ){
+          existing[f]=c[f];
+        }
       }
     }else{
-      groups.push({...c,bank,sources:[c.bureau],sourceCount:1});
+      groups.push({
+        ...c,
+        bank,
+        sources:[c.bureau],
+        sourceCount:1
+      });
     }
   }
+
   return groups.sort((a,b)=>b.date-a.date);
 }
 function creditDedupApps(docs){
