@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v10.1 hybrid: локальный парсер + AI-fallback для нераспознанных блоков Скоринг Бюро + объединение одинаковых договоров между БКИ. AI не используется как единственный источник и не должен додумывать отсутствующие данные.</div>
+<div class="analyzer-note">v10.2 hybrid: локальный парсер + AI-fallback для нераспознанных блоков Скоринг Бюро + объединение одинаковых договоров между БКИ. AI не используется как единственный источник и не должен додумывать отсутствующие данные.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1349,7 +1349,7 @@ function creditParseScoringContracts(text){
 }
 
 async function creditAiAnalyzeBlock(block,bureau='Скоринг Бюро'){
-  const response=await fetch('/api/analyze-bki',{
+  const response=await fetch('https://dolgnavigator.vercel.app/api/analyze-bki',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({bureau,text:block.slice(0,48000)})
   });
