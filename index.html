@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v15 BKI real structure: парсеры привязаны к фактической структуре файлов Куватова. ОКБ: одна строка «N. кредитор — Договор займа (кредита)» = одна карточка. Скоринг: одна строка «Договор №N» = одна карточка; заявки считаются только по строкам дата+УИД, запросы — по строкам дата+тип пользователя. УИД между ОКБ и Скорингом собирается полностью, включая перенос внутри карточки.</div>
+<div class="analyzer-note">v16 PDF layout: исправлен корневой источник ошибок — текст PDF теперь восстанавливается по координатам X/Y элементов страницы, а не по ненадёжному item.hasEOL. Это сохраняет реальные строки таблиц ОКБ и Скоринг Бюро: заголовки договоров, дата+УИД заявок и дата+тип пользователя запросов. После этого локальный парсер и AI-контроль работают уже по корректной строковой структуре PDF.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -1150,23 +1150,79 @@ function creditSetProgress(v){
   if(bar) bar.style.width=Math.max(0,Math.min(100,v))+'%';
 }
 
+function creditPageToLayoutText(items){
+  // PDF.js item.hasEOL ненадёжен для табличных БКИ:
+  // визуально одна строка таблицы часто разбивается на несколько текстовых элементов
+  // без hasEOL. Восстанавливаем строки по координате Y, затем сортируем колонки по X.
+  const rows=[];
+
+  for(const item of (items||[])){
+    if(!item?.str || !String(item.str).trim()) continue;
+
+    const tr=item.transform||[];
+    const x=Number(tr[4]||0);
+    const y=Number(tr[5]||0);
+
+    let row=rows.find(r=>Math.abs(r.y-y)<=2.2);
+    if(!row){
+      row={y,items:[]};
+      rows.push(row);
+    }
+    row.items.push({x,text:String(item.str)});
+  }
+
+  // В PDF координата Y растёт снизу вверх.
+  rows.sort((a,b)=>b.y-a.y);
+
+  return rows.map(row=>{
+    row.items.sort((a,b)=>a.x-b.x);
+
+    let line='';
+    let prev=null;
+
+    for(const it of row.items){
+      const s=it.text.replace(/\s+/g,' ').trim();
+      if(!s) continue;
+
+      if(!line){
+        line=s;
+      }else{
+        // Не пытаемся вычислять реальные ширины шрифтов:
+        // один пробел сохраняет лексические границы, а парсеры используют \s+.
+        line+=' '+s;
+      }
+      prev=it;
+    }
+
+    return line.trim();
+  }).filter(Boolean).join('\n');
+}
+
 async function creditExtract(file,fileIndex,totalFiles){
   const pdfjs = await creditWaitPdfJs();
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await pdfjs.getDocument({data}).promise;
   const pages=[];
+
   for(let p=1;p<=pdf.numPages;p++){
-    const page = await pdf.getPage(p);
-    const content = await page.getTextContent();
-    let text='';
-    for(const item of content.items){
-      if(!item.str) continue;
-      text += item.str + (item.hasEOL ? '\n' : ' ');
-    }
-    pages.push(creditNormalizeText(text));
-    creditSetProgress((fileIndex/totalFiles)*100 + (p/pdf.numPages)*(100/totalFiles));
+    const page=await pdf.getPage(p);
+    const content=await page.getTextContent();
+
+    // v16: принципиально не используем item.hasEOL.
+    const pageText=creditPageToLayoutText(content.items);
+    pages.push(creditNormalizeText(pageText));
+
+    creditSetProgress(
+      (fileIndex/totalFiles)*100 +
+      (p/pdf.numPages)*(100/totalFiles)
+    );
   }
-  return {name:file.name,text:pages.join('\n\n'),numPages:pdf.numPages};
+
+  return {
+    name:file.name,
+    text:pages.join('\n\n'),
+    numPages:pdf.numPages
+  };
 }
 
 function creditDetectBureau(text){
@@ -1617,30 +1673,35 @@ function creditLocalSignals(doc){
   };
 
   if(doc.bureau==='Скоринг Бюро'){
-    // Не считаем упоминания "Договор №" внутри текста — только заголовки карточек.
-    signals.contractMarkers=(t.match(/^\s*Договор\s*№\s*\d+\s*-/gmi)||[]).length;
+    // creditScoringContractBlocks уже знает реальные границы карточек.
+    signals.contractMarkers=creditScoringContractBlocks(t).length;
 
     const aStart=t.search(/Сведения об обращении субъекта к источнику с предложением совершить сделку/i);
     const qStart=t.lastIndexOf('СВЕДЕНИЯ О ЗАПРОСАХ КРЕДИТНОЙ ИСТОРИИ');
 
     if(aStart>=0){
       const ap=t.slice(aStart,qStart>aStart?qStart:t.length);
-      signals.applicationMarkers=(ap.match(/^\s*\d{2}\.\d{2}\.\d{4}\s+[0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}/gm)||[]).length;
+      signals.applicationMarkers=(ap.match(
+        /^\s*\d{2}\.\d{2}\.\d{4}\s+[0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}/gm
+      )||[]).length;
     }
 
     if(qStart>=0){
       const qp=t.slice(qStart);
-      signals.queryMarkers=(qp.match(/^\s*\d{2}\.\d{2}\.\d{4}\s+(?:Банк|МФО|Иной(?: пользователь)?)/gmi)||[]).length;
+      signals.queryMarkers=(qp.match(
+        /^\s*\d{2}\.\d{2}\.\d{4}\s+(?:Банк|МФО|Иной(?: пользователь)?)/gmi
+      )||[]).length;
     }
   }else if(doc.bureau==='ОКБ / Кредистория'){
-    signals.contractMarkers=(t.match(/^\s*\d{1,3}\.\s*.*?-\s*Договор займа\s*\(кредита\)\s*-/gmi)||[]).length;
+    // Тот же marker, по которому реально строится parser.
+    signals.contractMarkers=(t.match(
+      /(?:^|\n)\s*\d{1,3}\.\s*[А-ЯA-ZЁ0-9"'«»().\- _]{2,180}\s*-\s*Договор займа\s*\(кредита\)\s*-/gmi
+    )||[]).length;
 
-    // Для заявок и запросов ОКБ текущие таблицы не имеют столь же надёжного
-    // построчного маркера. Не используем ложные "20" и "39" как контрольный denominator.
+    // Для заявок/запросов ОКБ denominator пока не используем:
+    // существующие локальные парсеры уже дают содержимое, но структура отчёта другая.
     signals.applicationMarkers=0;
     signals.queryMarkers=0;
-  }else{
-    signals.contractMarkers=(t.match(/Договор займа\s*\(кредита\)/gi)||[]).length;
   }
 
   const incomplete=(actual,markers,minMarkers=3)=>
@@ -1936,20 +1997,21 @@ function creditParseScoringApplications(text){
     current=null;
   };
 
-  // Реальная строка таблицы начинается именно "дата + первая часть УИД".
+  // После v16 строка таблицы восстанавливается по Y-координате:
+  // 20.11.2024  a0c2...-  ООО ...  Заемщик  15 000.00 RUB ... Отказ ...
   const rowStart=/^\s*(\d{2}\.\d{2}\.\d{4})\s+([0-9a-fA-F]{8}-[0-9a-fA-F-]{8,})\s+(.*)$/;
 
   for(const line of lines){
-    const m=line.match(rowStart);
-    if(m){
+    const rm=line.match(rowStart);
+    if(rm){
       flush();
       current={
-        date:m[1],
-        uid1:m[2],
-        firstRest:m[3]||'',
-        lines:[m[3]||'']
+        date:rm[1],
+        uid1:rm[2],
+        lines:[rm[3]||'']
       };
     }else if(current){
+      // Продолжение УИД/названия кредитора может оказаться следующей визуальной строкой.
       current.lines.push(line);
     }
   }
@@ -1958,40 +2020,33 @@ function creditParseScoringApplications(text){
   const out=[];
 
   for(const r of rows){
-    const first=(r.firstRest||'').replace(/\s+/g,' ').trim();
     const all=r.lines.join(' ').replace(/\s+/g,' ').trim();
+    if(!all) continue;
 
-    // На первой строке таблицы кредитор расположен между первой частью УИД и "Заемщик".
-    const borrowerPos=first.search(/\bЗаемщик\b/i);
+    const borrowerPos=all.search(/\bЗаемщик\b/i);
     if(borrowerPos<0) continue;
 
-    let bankRaw=first.slice(0,borrowerPos).trim();
-    let bank=creditNormBank(bankRaw);
+    let left=all.slice(0,borrowerPos).trim();
 
-    // Если название кредитора перенесено, пытаемся добавить продолжение со следующей строки,
-    // но не хвост УИД.
-    if((bank==='Банк не определён' || bankRaw.length<4 || /(?:ранее|ООО|АО|ПАО)\s*[-–]?$/.test(bankRaw)) && r.lines.length>1){
-      let continuation=(r.lines[1]||'')
-        .replace(/^\s*[0-9a-fA-F-]{5,}\s*/,'')
-        .replace(/\s+/g,' ')
-        .trim();
-      if(continuation && !/\bЗаемщик\b/i.test(continuation)){
-        bank=creditNormBank((bankRaw+' '+continuation).trim());
-      }
+    // Если в начале left лежит хвост УИД, снимаем его с кредитора.
+    let uid2='';
+    const uid2m=left.match(/^([0-9a-fA-F-]{5,})\s+(.+)$/);
+    if(uid2m){
+      uid2=uid2m[1];
+      left=uid2m[2];
     }
 
+    const uid=(r.uid1+(uid2||''))
+      .replace(/\s+/g,'')
+      .replace(/--+/g,'-')
+      .toLowerCase();
+
+    const bank=creditNormBank(left);
     if(bank==='Банк не определён' || creditIsStructuralName(bank)) continue;
 
-    // Вторая часть УИД почти всегда находится в начале следующей строки.
-    let uid2='';
-    for(const ln of r.lines.slice(1,3)){
-      const um=(ln||'').match(/^\s*([0-9a-fA-F-]{5,})\b/);
-      if(um){ uid2=um[1]; break; }
-    }
-    const uid=(r.uid1+(uid2||'')).replace(/\s+/g,'').replace(/--+/g,'-').toLowerCase();
-
-    const amountM=all.match(/\bЗаемщик\s+(\d[\d ]*(?:[.,]\d{2})?)\s*RUB/i);
-    const statusM=all.match(/\b(Отказ|Выдано|Одобрено|Одобрена|На рассмотрении|Договор заключ[её]н)\b/i);
+    const rest=all.slice(borrowerPos);
+    const amountM=rest.match(/Заемщик\s+(\d[\d ]*(?:[.,]\d{2})?)\s*RUB/i);
+    const statusM=rest.match(/\b(Отказ|Выдано|Одобрено|Одобрена|На рассмотрении|Договор заключ[её]н)\b/i);
     if(!statusM) continue;
 
     out.push({
@@ -2003,7 +2058,7 @@ function creditParseScoringApplications(text){
       amountNum:amountM?creditMoneyNumber(amountM[1]):null,
       status:statusM[1].replace(/\s+/g,' '),
       uid,
-      bureauType:'scoring-app-v15'
+      bureauType:'scoring-app-v16'
     });
   }
 
@@ -2754,7 +2809,7 @@ function creditRenderResult(docs){
 
     <div class="merge-card">
       <h3>После объединения БКИ</h3>
-      <p>Сначала локальный парсер сверяет результат с количеством структурных карточек/строк отчёта, затем AI проверяет неполные разделы и контрольные фрагменты. Основное объединение договоров выполняется по точному УИД. Резервное сопоставление используется только для взаимно-однозначных пар с совпавшим кредитором, датой ±1 день и совместимой известной суммой.</p>
+      <p>PDF сначала восстанавливается в реальные визуальные строки по координатам X/Y. Затем локальный парсер сверяет результат со структурой отчёта, а AI проверяет неполные разделы и контрольные фрагменты. Основное объединение договоров выполняется по точному УИД. Резервное сопоставление используется только для взаимно-однозначных пар с совпавшим кредитором, датой ±1 день и совместимой известной суммой.</p>
       <div class="merge-pills">
         <span class="merge-pill">Уникальных договоров: ${loans.length}</span>
         <span class="merge-pill">Подтверждены 2+ БКИ: ${confirmed2}</span>
