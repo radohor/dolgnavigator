@@ -24,7 +24,67 @@ export default async function handler(req, res) {
 
     let task = "";
 
-    if (kind === "full_extract") {
+    if (kind === "contracts_blocks") {
+      task = `
+Перед тобой набор уже выделенных карточек кредитных договоров ОКБ.
+Каждая карточка начинается маркером [[CONTRACT_BLOCK N]].
+
+Извлеки РОВНО реальные договоры из этих карточек.
+Не пропускай карточку только потому, что часть полей отсутствует.
+Не создавай больше одного договора на один CONTRACT_BLOCK.
+Собирай полное название кредитора и полный Идентификатор сделки/УИД.
+Ничего не выдумывай.
+
+Верни ТОЛЬКО JSON:
+{
+  "contracts": [{
+    "creditor": "string или null",
+    "contract_date": "YYYY-MM-DD или null",
+    "amount": 0,
+    "currency": "RUB или null",
+    "contract_id": "string или null",
+    "uid": "string или null",
+    "status": "string или null",
+    "product": "string или null",
+    "first_overdue_date": "YYYY-MM-DD или null",
+    "max_overdue_days": 0,
+    "paid_total": 0,
+    "actual_end_date": "YYYY-MM-DD или null",
+    "termination_basis": "string или null",
+    "source_page": null,
+    "confidence": "high|medium|low",
+    "evidence": "до 12 слов"
+  }],
+  "warnings": []
+}`;
+    } else if (kind === "applications_rows") {
+      task = `
+Перед тобой строки таблицы кредитных заявлений Скоринг Бюро.
+Каждая запись начинается маркером [[APPLICATION_ROW N]].
+
+Извлеки РОВНО реальные заявления/обращения.
+Одна строка/запись таблицы = максимум одно заявление.
+Собери полное название кредитора, полный УИД обращения, дату, сумму и статус.
+Статус "Отказ" и "Выдано" особенно важен.
+Не превращай договоры и запросы кредитной истории в заявления.
+Ничего не выдумывай.
+
+Верни ТОЛЬКО JSON:
+{
+  "applications": [{
+    "creditor": "string или null",
+    "application_date": "YYYY-MM-DD или null",
+    "amount": 0,
+    "currency": "RUB или null",
+    "uid": "string или null",
+    "status": "Отказ|Выдано|Одобрено|На рассмотрении|иное",
+    "source_page": null,
+    "confidence": "high|medium|low",
+    "evidence": "до 12 слов"
+  }],
+  "warnings": []
+}`;
+    } else if (kind === "full_extract") {
       task = `
 Ты являешься ОСНОВНЫМ парсером российского кредитного отчета БКИ.
 Перед тобой фрагмент отчета с маркерами страниц вида [[PAGE 123]].
