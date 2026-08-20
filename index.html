@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v18 AI-first: ИИ является основным читателем БКИ. PDF извлекается постранично, затем отправляется в AI логическими чанками. Локальный код больше не пытается regex-ами извлекать договоры, заявки и запросы; он только проверяет структуру, дедуплицирует результаты, объединяет БКИ по УИД/ID и строит юридический анализ.</div>
+<div class="analyzer-note">v19 selective AI: локальный код читает только те разделы, которые уже показали стабильность; AI получает не весь PDF, а только проблемные структурные записи. Скоринг: договоры и запросы читаются локально, заявления — AI по строкам таблицы. ОКБ: договорные карточки — AI по готовым блокам; остальные разделы остаются локальными. Это резко уменьшает число AI-вызовов и время анализа.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -2337,6 +2337,231 @@ function creditQueries(text){
 }
 
 
+
+function creditScoringApplicationRows(text){
+  const start=text.search(/Сведения об обращении субъекта к источнику с предложением совершить сделку/i);
+  if(start<0) return [];
+
+  const qpos=text.lastIndexOf('СВЕДЕНИЯ О ЗАПРОСАХ КРЕДИТНОЙ ИСТОРИИ');
+  const part=text.slice(start,qpos>start?qpos:text.length).replace(/\r/g,'');
+
+  const starts=[];
+  const re=/^\s*\d{2}\.\d{2}\.\d{4}\s+[0-9a-fA-F]{8}-[0-9a-fA-F-]{8,}/gm;
+  let m;
+  while((m=re.exec(part))) starts.push(m.index);
+
+  const rows=[];
+  for(let i=0;i<starts.length;i++){
+    const raw=part.slice(starts[i],i+1<starts.length?starts[i+1]:part.length).trim();
+    if(raw) rows.push(raw);
+  }
+  return rows;
+}
+
+function creditOkbContractBlocks(text){
+  const headRe=/^\s*(\d{1,3})\.\s*.*?\s*-\s*Договор займа\s*\(кредита\)\s*-\s*.*$/gmi;
+  const starts=[];
+  let m;
+  while((m=headRe.exec(text))){
+    starts.push({index:m.index,header:m[0],ordinal:Number(m[1])});
+  }
+
+  const blocks=[];
+  for(let i=0;i<starts.length;i++){
+    const start=starts[i].index;
+    const end=i+1<starts.length?starts[i+1].index:text.length;
+    const raw=text.slice(start,end).trim();
+    if(raw) blocks.push({
+      ordinal:starts[i].ordinal,
+      text:raw
+    });
+  }
+  return blocks;
+}
+
+function creditBatchTextItems(items,maxChars=28000,maxItems=40,label='ITEM'){
+  const batches=[];
+  let current=[];
+  let chars=0;
+
+  const flush=()=>{
+    if(!current.length) return;
+    batches.push(current);
+    current=[];
+    chars=0;
+  };
+
+  for(let i=0;i<items.length;i++){
+    const payload=typeof items[i]==='string'?items[i]:(items[i].text||'');
+    const wrapped=`[[${label} ${i+1}]]\n${payload}\n`;
+    if(current.length && (chars+wrapped.length>maxChars || current.length>=maxItems)) flush();
+    current.push({index:i,text:wrapped,original:items[i]});
+    chars+=wrapped.length;
+  }
+  flush();
+  return batches;
+}
+
+async function creditSelectiveAiRequest(kind,batch,bureau,fileName,batchIndex,totalBatches){
+  const joined=batch.map(x=>x.text).join('\n\n');
+  const response=await fetch('https://dolgnavigator.vercel.app/api/analyze-bki',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      kind,
+      bureau,
+      text:joined,
+      meta:{
+        fileName,
+        batchIndex,
+        totalBatches,
+        itemIndexes:batch.map(x=>x.index+1)
+      }
+    })
+  });
+
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(data?.error||data?.message||('AI API '+response.status));
+  return data?.result||{};
+}
+
+async function creditRunBatches(batches,worker,onProgress,concurrency=5){
+  const out=[];
+  let completed=0;
+
+  for(let base=0;base<batches.length;base+=concurrency){
+    const group=batches.slice(base,base+concurrency);
+    const results=await Promise.all(group.map(async (batch,offset)=>{
+      const bi=base+offset;
+      try{
+        const r=await worker(batch,bi,batches.length);
+        return {ok:true,r,bi};
+      }catch(e){
+        return {ok:false,error:e,bi};
+      }
+    }));
+
+    for(const item of results){
+      completed++;
+      onProgress?.(completed,batches.length);
+      out.push(item);
+    }
+  }
+
+  return out;
+}
+
+async function creditSelectiveAnalyzeDoc(doc,onProgress){
+  const bureau=creditDetectBureau(doc.text);
+  let contracts=[],applications=[],queries=[];
+  let aiCalls=0,aiFailures=0;
+  const warnings=[];
+
+  if(bureau==='Скоринг Бюро'){
+    // Доказанно стабильные локальные разделы.
+    contracts=creditParseScoringContracts(doc.text);
+    queries=creditParseScoringQueries(doc.text);
+
+    // Проблемный раздел: заявления. AI получает только 278 структурных строк.
+    const rows=creditScoringApplicationRows(doc.text);
+    const batches=creditBatchTextItems(rows,26000,45,'APPLICATION_ROW');
+
+    const results=await creditRunBatches(
+      batches,
+      async (batch,bi,total)=>{
+        aiCalls++;
+        return creditSelectiveAiRequest('applications_rows',batch,bureau,doc.name,bi+1,total);
+      },
+      onProgress,
+      5
+    );
+
+    const recovered=[];
+    for(const x of results){
+      if(!x.ok){ aiFailures++; warnings.push(x.error?.message||String(x.error)); continue; }
+      recovered.push(...(x.r.applications||[]));
+    }
+
+    applications=creditAiFirstDedupApplications(
+      recovered.map(a=>creditAiNormalizeApplication(a,bureau,{startPage:null}))
+    );
+
+  }else if(bureau==='ОКБ / Кредистория'){
+    // ОКБ-заявки/запросы локально уже извлекаются; не тратим AI.
+    applications=creditApplications(doc.text);
+    queries=creditParseOkbQueries(doc.text);
+
+    // Проблемный раздел: 56 договорных карточек.
+    const blocks=creditOkbContractBlocks(doc.text);
+    const batches=creditBatchTextItems(blocks,30000,8,'CONTRACT_BLOCK');
+
+    const results=await creditRunBatches(
+      batches,
+      async (batch,bi,total)=>{
+        aiCalls++;
+        return creditSelectiveAiRequest('contracts_blocks',batch,bureau,doc.name,bi+1,total);
+      },
+      onProgress,
+      5
+    );
+
+    const recovered=[];
+    for(const x of results){
+      if(!x.ok){ aiFailures++; warnings.push(x.error?.message||String(x.error)); continue; }
+      recovered.push(...(x.r.contracts||[]));
+    }
+
+    contracts=creditAiFirstDedupContracts(
+      recovered.map(c=>creditAiNormalizeContract(c,bureau,{startPage:null}))
+    );
+
+  }else{
+    // Неизвестный формат: безопасный fallback на старый локальный анализ.
+    const local=creditAnalyzeDoc(doc);
+    contracts=local.contracts;
+    applications=local.applications;
+    queries=local.queries;
+  }
+
+  const analyzed={
+    ...doc,
+    bureau,
+    contracts,
+    applications,
+    queries,
+    overdue180:/ПРОСРОЧК[АИ][^\n]{0,60}180\+/i.test(doc.text),
+    bankruptcy:/БАНКРОТСТВ/i.test(doc.text),
+    selectiveAi:{
+      calls:aiCalls,
+      failures:aiFailures,
+      warnings
+    }
+  };
+
+  const signals=creditLocalSignals(analyzed);
+  const anomalies=[];
+
+  if(signals.contractMarkers>=3 &&
+     contracts.length<Math.floor(signals.contractMarkers*0.90))
+    anomalies.push(`договоры ${contracts.length}/${signals.contractMarkers}`);
+
+  if(signals.applicationMarkers>=10 &&
+     applications.length<Math.floor(signals.applicationMarkers*0.90))
+    anomalies.push(`заявки ${applications.length}/${signals.applicationMarkers}`);
+
+  if(signals.queryMarkers>=10 &&
+     queries.length<Math.floor(signals.queryMarkers*0.90))
+    anomalies.push(`запросы ${queries.length}/${signals.queryMarkers}`);
+
+  if(aiFailures) anomalies.push(`ошибок AI-вызовов: ${aiFailures}`);
+
+  analyzed.selectiveAi.signals=signals;
+  analyzed.selectiveAi.anomalies=anomalies;
+  analyzed.selectiveAi.verdict=anomalies.length?'needs-review':'complete';
+
+  return analyzed;
+}
+
 function creditAiChunkPages(pages,maxChars=52000,overlapPages=1){
   const chunks=[];
   let i=0;
@@ -3068,15 +3293,15 @@ function creditRenderResult(docs){
     }).join('');
 
   const aiFirstProblems=docs.flatMap(d=>
-    (d.aiFirst?.verdict&&d.aiFirst.verdict!=='complete')
-      ? [`${d.bureau}: ${(d.aiFirst?.anomalies||[]).join(', ')}`]
+    (d.selectiveAi?.verdict&&d.selectiveAi.verdict!=='complete')
+      ? [`${d.bureau}: ${(d.selectiveAi?.anomalies||[]).join(', ')}`]
       : []
   );
   const aiQualityGateHtml=aiFirstProblems.length?`
     <div class="finding-card risk">
-      <h4>AI-first обнаружил неполный разбор БКИ</h4>
+      <h4>Selective AI обнаружил неполный разбор БКИ</h4>
       <p>${aiFirstProblems.map(escapeHtml).join('<br>')}</p>
-      <p><b>Юридический вывод ниже считается предварительным до повторной проверки проблемных страниц.</b></p>
+      <p><b>Юридический вывод ниже считается предварительным до повторной проверки проблемного раздела.</b></p>
     </div>`:'';
 
   const mergeAuditHtml=mergeAudit?`
@@ -3095,9 +3320,9 @@ function creditRenderResult(docs){
     const open=dc.filter(c=>/действ|открыт/i.test(c.status||'')).length;
     const closed=dc.filter(c=>/закрыт|прекращ/i.test(c.status||'')).length;
     const rej=d.applications.filter(a=>/отказ/i.test(a.status||'')).length;
-    const af=d.aiFirst;
+    const af=d.selectiveAi;
     const sig=af?.signals||creditLocalSignals(d);
-    const aiLine=af?`<div style="margin-top:8px;font-size:12px;color:${af.verdict==='complete'?'#607077':'#9a3412'}"><b>AI-first:</b> ${escapeHtml(af.verdict||'')} · чанки ${af.completed||0}/${af.chunks||0} · договоры ${dc.length} · заявки ${d.applications.length} · запросы ${d.queries.length}</div>`:'';
+    const aiLine=af?`<div style="margin-top:8px;font-size:12px;color:${af.verdict==='complete'?'#607077':'#9a3412'}"><b>Selective AI:</b> ${escapeHtml(af.verdict||'')} · AI-вызовов ${af.calls||0} · ошибок ${af.failures||0}</div>`:'';
     const qcLine=af?`<div style="margin-top:3px;font-size:11px;color:#607077">Структурный контроль: договоры ${dc.length}/${sig.contractMarkers||'—'} · заявки ${d.applications.length}/${sig.applicationMarkers||'—'} · запросы ${d.queries.length}/${sig.queryMarkers||'—'}</div>`:'';
     const qcWarn=af?.anomalies?.length?`<div style="margin-top:4px;font-size:12px;color:#8a5a00">${af.anomalies.map(w=>escapeHtml(w)).join(' · ')}</div>`:'';
     return `<div class="source-card">
@@ -3156,7 +3381,7 @@ function creditRenderResult(docs){
 
     <div class="merge-card">
       <h3>После объединения БКИ</h3>
-      <p>ИИ читает весь отчёт постраничными чанками и возвращает структурированные договоры, заявки и запросы. Код затем проверяет полноту по структуре отчёта и объединяет данные между БКИ. Основное объединение договоров между БКИ выполняется детерминированно по точному УИД, затем по ID договора. Мягкое сопоставление допускается только для взаимно-однозначных пар без конфликта УИД.</p>
+      <p>Код читает стабильные разделы локально. AI получает только проблемные структурные строки и карточки, после чего код проверяет полноту и объединяет данные между БКИ. Основное объединение договоров между БКИ выполняется детерминированно по точному УИД, затем по ID договора. Мягкое сопоставление допускается только для взаимно-однозначных пар без конфликта УИД.</p>
       <div class="merge-pills">
         <span class="merge-pill">Уникальных договоров: ${loans.length}</span>
         <span class="merge-pill">Подтверждены 2+ БКИ: ${confirmed2}</span>
@@ -3221,13 +3446,11 @@ async function creditRun(){
       btn.textContent=`Извлекаю текст PDF ${i+1}/${creditFiles.length}…`;
       const extracted=await creditExtract(creditFiles[i],i,creditFiles.length);
 
-      btn.textContent=`AI читает БКИ ${i+1}/${creditFiles.length}…`;
+      btn.textContent=`AI читает только проблемные разделы ${i+1}/${creditFiles.length}…`;
 
-      const analyzed=await creditAiFirstAnalyzeDoc(extracted,(done,total)=>{
-        btn.textContent=`AI читает БКИ ${i+1}/${creditFiles.length}: ${done}/${total}`;
-        const fileBase=35*(i/creditFiles.length);
-        const aiBase=35/creditFiles.length;
-        creditSetProgress(Math.min(96,35 + (i/creditFiles.length)*60 + (done/total)*(60/creditFiles.length)));
+      const analyzed=await creditSelectiveAnalyzeDoc(extracted,(done,total)=>{
+        btn.textContent=`AI: ${done}/${total} пакетов`;
+        creditSetProgress(Math.min(96,40 + (i/creditFiles.length)*50 + (done/Math.max(1,total))*(50/creditFiles.length)));
       });
 
       docs.push(analyzed);
