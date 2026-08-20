@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v21 working core: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ и Скоринг распознаются отдельными адаптерами, договоры объединяются по точному УИД.</div>
+<div class="analyzer-note">v21.1 stable counts: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ и Скоринг распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -3119,20 +3119,29 @@ function creditDedupLoans(docs){
 }
 
 function creditDedupApps(docs){
-  const all=docs.flatMap(d=>d.applications.map(a=>({...a,bureau:d.bureau,bank:creditNormBank(a.bank||a.source)})))
-    .filter(a=>a.date&&a.bank!=='Банк не определён');
+  const all=docs.flatMap(d=>d.applications.map((a,sourceRowIndex)=>({
+    ...a,
+    bureau:d.bureau,
+    sourceRowIndex,
+    bank:creditNormBank(a.bank||a.source)
+  }))).filter(a=>a.date&&a.bank!=='Банк не определён');
 
+  // В БКИ разные УИД означают разные реальные заявления, даже если
+  // дата + кредитор + сумма совпадают. Строки без УИД также не схлопываем:
+  // в эталонном Скоринге есть 19 легитимных старых заявок без УИД.
+  // Между разными БКИ объединяем только точный одинаковый непустой УИД.
   const out=[];
-  const seen=new Set();
+  const uidOwner=new Map();
 
   for(const a of all){
     const uid=String(a.uid||'').trim().toLowerCase();
-    const key=uid
-      ? 'uid|'+uid
-      : creditFmt(a.date)+'|'+creditBankFingerprint(a.bank)+'|'+Math.round(a.amountNum||0)+'|'+String(a.status||'').toLowerCase();
 
-    if(seen.has(key)) continue;
-    seen.add(key);
+    if(uid){
+      const existing=uidOwner.get(uid);
+      if(existing && existing.bureau!==a.bureau) continue;
+      if(!existing) uidOwner.set(uid,a);
+    }
+
     out.push(a);
   }
   return out;
@@ -3300,8 +3309,15 @@ function creditRenderResult(docs){
   const root=document.getElementById('creditResults');
   const loans=creditDedupLoans(docs);
   const apps=creditDedupApps(docs);
-  const queries=creditUniq(docs.flatMap(d=>d.queries.map(q=>({...q,bureau:d.bureau,bank:creditNormBank(q.bank||q.source)})))
-    .filter(q=>q.date&&q.bank!=='Банк не определён'),q=>creditFmt(q.date)+'|'+q.bank+'|'+String(q.purpose||''));
+  // Парсер конкретного БКИ уже отвечает за границы записей.
+  // Повторные запросы в один день одному пользователю КИ являются
+  // самостоятельными событиями и не должны схлопываться по date+bank+purpose.
+  const queries=docs.flatMap(d=>d.queries.map((q,sourceRowIndex)=>({
+    ...q,
+    bureau:d.bureau,
+    sourceRowIndex,
+    bank:creditNormBank(q.bank||q.source)
+  }))).filter(q=>q.date&&q.bank!=='Банк не определён');
   const verdict=creditOverallVerdict(loans,apps);
   const rejected=apps.filter(a=>/отказ/i.test(a.status||'')).length;
   const confirmed2=loans.filter(l=>(l.sources||[]).length>=2).length;

@@ -1,2 +1,2 @@
-PyMuPDF
-pdfplumber
+PyMuPDF==1.26.7
+pdfplumber==0.11.9
