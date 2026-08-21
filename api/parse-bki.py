@@ -13,6 +13,7 @@ from layout_utils import get_full_text, find_section
 from okb_adapter import parse_all_cards
 from scoring_adapter import parse_contracts_summary, parse_applications, parse_queries, VID_UCHASTIYA
 from scoring_uid_map import extract_scoring_uid_map
+from nbki_adapter import parse_nbki
 
 MAX_FILE_BYTES = 4_300_000
 
@@ -22,6 +23,11 @@ def _probe_text(pdf_path: str, pages: int = 12) -> str:
 
 def detect_bureau(pdf_path: str) -> str:
     probe = _probe_text(pdf_path).upper()
+
+    if ("КРЕДИТНЫЙ ОТЧЕТ ДЛЯ СУБЪЕКТА" in probe
+        and ("ОБРАЩАЙТЕСЬ В НБКИ" in probe or "SYSTEM VERSION:" in probe)):
+        return "nbki"
+
     if "СВОДНАЯ ИНФОРМАЦИЯ ПО ДОГОВОРАМ ЗАЙМА" in probe:
         return "scoring"
     if ("КРЕДИСТОРИЯ" in probe or "ОБЪЕДИНЕННОГО КРЕДИТНОГО БЮРО" in probe
@@ -29,7 +35,7 @@ def detect_bureau(pdf_path: str) -> str:
         return "okb"
     if "ПОДРОБНАЯ ИНФОРМАЦИЯ ПО ДОГОВОРАМ" in probe and "КОД ОТЧЕТА" in probe:
         return "scoring"
-    raise ValueError("Формат БКИ не распознан. Поддерживаются ОКБ/Кредистория и Скоринг Бюро.")
+    raise ValueError("Формат БКИ не распознан. Поддерживаются НБКИ, ОКБ/Кредистория и Скоринг Бюро.")
 
 def _clean_join(parts) -> str:
     if not parts:
@@ -113,6 +119,39 @@ def parse_pdf(pdf_path: str) -> dict:
     doc = pymupdf.open(pdf_path)
     page_count = len(doc)
     doc.close()
+
+    if bureau == "nbki":
+        parsed = parse_nbki(pdf_path)
+        contracts = parsed["contracts"]
+        applications = parsed["applications"]
+        queries = parsed["queries"]
+        return {
+            "ok": True,
+            "bureau": "НБКИ",
+            "bureau_code": "nbki",
+            "page_count": page_count,
+            "counts": {
+                "contracts": len(contracts),
+                "applications": len(applications),
+                "queries": len(queries),
+            },
+            "contracts": contracts,
+            "applications": applications,
+            "queries": queries,
+            "meta": {
+                "uid_nonempty": sum(1 for r in contracts if r.get("uid")),
+                "uid_unique": len({r["uid"] for r in contracts if r.get("uid")}),
+                "application_uid_nonempty": sum(1 for a in applications if a.get("uid")),
+                "summary_counts": parsed.get("summary_counts", {}),
+                "sections_verified": ["contracts", "queries", "applications-first-pass"],
+            },
+            "diagnostics": {
+                "file_sha256": file_sha256,
+                "python_version": platform.python_version(),
+                "pymupdf_version": getattr(pymupdf, "__version__", None),
+            },
+            "warnings": parsed.get("warnings", []),
+        }
 
     if bureau == "okb":
         raw = parse_all_cards(pdf_path)
