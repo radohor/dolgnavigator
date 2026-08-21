@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -87,6 +88,165 @@ def _summary_counts(text: str) -> dict:
     return result
 
 
+
+def _money_number(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    raw = value.upper().replace("RUB", "").replace(" ", "").strip()
+    if raw in {"", "Н/Д"}:
+        return None
+    # NBKI mixes 181891,24 and 181,891.00.
+    if "," in raw and "." in raw:
+        if raw.rfind(".") > raw.rfind(","):
+            raw = raw.replace(",", "")
+        else:
+            raw = raw.replace(".", "").replace(",", ".")
+    elif "," in raw:
+        parts = raw.split(",")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            raw = raw.replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _format_money_rub(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    if abs(value - round(value)) < 0.005:
+        return f"RUB {int(round(value))}"
+    return f"RUB {value:.2f}".replace(".", ",")
+
+
+def _modern_deal_header(chunk: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Modern NBKI contract table is emitted column-first by PyMuPDF:
+      Date of deal / Type / Product / Card / Amount / Planned end
+      then the row values.
+    Parse by table position, not by free text proximity.
+    """
+    m = re.search(
+        r"Дата сделки\s*\n"
+        r"Тип сделки\s*\n"
+        r"Вид займа \(кредита\)\s*\n"
+        r"(?:Использование\s*\nплатежной карты\s*\n)?"
+        r"Сумма и валюта\s*\n"
+        r"Дата прекращения\s*\nпо условиям сделки\s*\n"
+        r"(\d{2}-\d{2}-\d{4})\s*\n"
+        r"[\s\S]{0,220}?"
+        r"([0-9][0-9\s.,]*)\s+RUB\s*\n"
+        r"(\d{2}-\d{2}-\d{4}|Н/Д)",
+        chunk,
+        re.I
+    )
+    if not m:
+        return None, None, None
+    return _clean(m.group(1)), _clean(m.group(2) + " RUB"), _clean(m.group(3))
+
+
+def _modern_actual_end(chunk: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Modern NBKI termination table.
+
+    Labels end with:
+      "Прекращение обязательства"
+      "Дата фактического прекращения"
+    After that PyMuPDF emits row values. We stop before the next table heading
+    ("Возникновение обязательства..."), take the last date in that value block
+    as the actual termination date, and retain the textual termination basis.
+    """
+    lines = [x.strip() for x in chunk.splitlines()]
+    for i in range(len(lines) - 1):
+        if lines[i] == "Дата фактического" and lines[i + 1] == "прекращения":
+            values = []
+            for x in lines[i + 2:i + 45]:
+                if x.startswith("Возникновение обязательства"):
+                    break
+                values.append(x)
+
+            dates = [x for x in values if re.fullmatch(r"\d{2}-\d{2}-\d{4}", x)]
+            if not dates:
+                return None, None
+            actual = dates[-1]
+
+            # The basis is the non-boolean/non-date text immediately before
+            # the actual date. Join wrapped lines.
+            basis_parts = []
+            for x in values:
+                if x == actual:
+                    break
+                if not x or x in {"Да", "Нет", "Н/Д"}:
+                    continue
+                if re.fullmatch(r"\d{2}-\d{2}-\d{4}", x):
+                    continue
+                basis_parts.append(x)
+
+            basis = _clean(" ".join(basis_parts[-3:])) if basis_parts else None
+            return actual, basis
+    return None, None
+
+
+def _historical_max_debt(chunk: str) -> Optional[float]:
+    """
+    Historical maximum debt from modern NBKI 'Задолженность' table.
+    This is NOT the original credit limit and is stored separately.
+    """
+    start = chunk.find("\nЗадолженность")
+    if start < 0:
+        return None
+    end = chunk.find("\nПросроченная задолженность", start + 1)
+    section = chunk[start:end if end > start else min(len(chunk), start + 12000)]
+
+    values = []
+    # Typical NBKI row: date, calculation flag, total debt, principal, interest...
+    for m in re.finditer(
+        r"(?m)^(\d{2}-\d{2}-\d{4})\s*\n(?:Да|Нет|Н/Д)\s*\n([0-9][0-9.,]*)\s*$",
+        section
+    ):
+        v = _money_number(m.group(2))
+        if v is not None and v >= 0:
+            values.append(v)
+    return max(values) if values else None
+
+
+def _first_overdue_candidate(chunk: str, start_date: Optional[str]) -> Optional[str]:
+    """
+    Conservative candidate from the modern NBKI overdue-debt table.
+    Kept as a candidate field and is NOT fed into legal crisis analysis yet.
+    """
+    pos = chunk.find("\nПросроченная задолженность")
+    if pos < 0:
+        return None
+    section = chunk[pos:]
+    stop = section.find("\nУсловия платежей")
+    if stop > 0:
+        section = section[:stop]
+
+    candidates = []
+    for m in re.finditer(
+        r"(?m)^(\d{2}-\d{2}-\d{4})\s*\n(?:Да|Нет)\s*\n([0-9][0-9.,]*)\s*$",
+        section
+    ):
+        d = m.group(1)
+        amount = _money_number(m.group(2))
+        if amount is None or amount <= 0:
+            continue
+        if start_date and d == start_date:
+            continue
+        try:
+            dt = datetime.datetime.strptime(d, "%d-%m-%Y")
+        except ValueError:
+            continue
+        candidates.append((dt, d))
+
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][1]
+
 def parse_contracts(text: str) -> list[dict]:
     start = text.find("Обязательства и их исполнение")
     end = text.find("Информационная часть", start + 1)
@@ -106,39 +266,51 @@ def parse_contracts(text: str) -> list[dict]:
         uid = _first_guid_after(chunk, r"УИ[Дд]\s+договора(?:\s*\(сделки\))?\s*:")
         contract_id = _field(chunk, "Номер договора:")
 
-        # Modern NBKI blocks: date/amount are in a table after "Дата сделки".
+        # Old NBKI format has explicit label/value fields.
         start_date = _field(chunk, "Открыт:")
         amount = _field(chunk, "Размер/лимит:")
         status = _field(chunk, "Статус:")
+        status_date = _field(chunk, "Дата статуса:")
         current_debt = _field(chunk, "Задолж-сть:")
         overdue = _field(chunk, "Просрочено:")
+        planned_end = None
+        actual_end = None
+        termination_basis = None
+        historical_max = None
+        overdue_candidate = None
+        format_name = "legacy" if start_date or amount or status else "modern"
 
-        if not start_date:
-            marker = chunk.find("Дата сделки")
-            if marker >= 0:
-                tail = chunk[marker:marker+1800]
-                dm = DATE_RE.search(tail)
-                if dm:
-                    start_date = dm.group(1)
+        if format_name == "modern":
+            modern_start, modern_amount, planned_end = _modern_deal_header(chunk)
+            start_date = modern_start or start_date
+            amount = modern_amount or amount
 
-        if not amount:
-            # In modern table choose money immediately before RUB; first value is contract amount.
-            marker = chunk.find("Сумма и валюта")
-            if marker >= 0:
-                tail = chunk[marker:marker+1800]
-                mm = re.search(r"([0-9][0-9\s.,]*)\s*RUB\b", tail)
+            actual_end, termination_basis = _modern_actual_end(chunk)
+            historical_max = _historical_max_debt(chunk)
+            overdue_candidate = _first_overdue_candidate(chunk, start_date)
+
+            if actual_end:
+                status = "Обязательство прекращено"
+                status_date = actual_end
+
+            # Some modern reports print a concise debt aggregate.
+            if not current_debt:
+                mm = re.search(r"(?m)^Задолженность:\s*([^\n]+)$", chunk)
                 if mm:
-                    amount = _clean(mm.group(1) + " RUB")
+                    current_debt = _clean(mm.group(1))
+            if not overdue:
+                mm = re.search(r"(?m)^Просроченная задолженность:\s*([^\n]+)$", chunk)
+                if mm:
+                    overdue = _clean(mm.group(1))
 
-        # Modern blocks may have a concise aggregate debt heading on later pages.
-        if not current_debt:
-            mm = re.search(r"(?m)^Задолженность:\s*([^\n]+)$", chunk)
-            if mm:
-                current_debt = _clean(mm.group(1))
-        if not overdue:
-            mm = re.search(r"(?m)^Просроченная задолженность:\s*([^\n]+)$", chunk)
-            if mm:
-                overdue = _clean(mm.group(1))
+        reported_amount_num = _money_number(amount)
+        amount_quality = "reported"
+        if reported_amount_num == 0:
+            # Zero is a valid reported value (especially old cards), but it is not
+            # useful as an inferred original limit.
+            amount_quality = "reported_zero"
+        elif reported_amount_num is None:
+            amount_quality = "missing"
 
         out.append({
             "index": int(h.group(1)),
@@ -147,14 +319,22 @@ def parse_contracts(text: str) -> list[dict]:
             "creditor": creditor,
             "product": product,
             "amount": amount,
+            "amount_quality": amount_quality,
             "start_date": start_date,
+            "planned_end_date": planned_end,
+            "actual_end_date": actual_end,
             "status": status,
+            "status_date": status_date,
+            "termination_basis": termination_basis,
             "current_debt": current_debt,
             "current_overdue_amount": overdue,
+            "historical_max_debt": _format_money_rub(historical_max),
+            "first_overdue_date_candidate": overdue_candidate,
+            "first_overdue_date_candidate_confidence": "medium" if overdue_candidate else None,
+            "format": format_name,
             "source_title": title,
         })
     return out
-
 
 def _modern_application_blocks(text: str) -> list[dict]:
     """
@@ -333,10 +513,21 @@ def parse_nbki(pdf_path: str) -> dict:
             f"НБКИ сообщает {summary['queries']} запросов, детально распознано {len(queries)}."
         )
 
+    zero_amount_contracts = sum(
+        1 for c in contracts if c.get("amount_quality") == "reported_zero"
+    )
+    overdue_candidates = sum(
+        1 for c in contracts if c.get("first_overdue_date_candidate")
+    )
+
     return {
         "contracts": contracts,
         "applications": applications,
         "queries": queries,
         "summary_counts": summary,
+        "contract_qc": {
+            "reported_zero_amounts": zero_amount_contracts,
+            "overdue_date_candidates": overdue_candidates,
+        },
         "warnings": warnings,
     }

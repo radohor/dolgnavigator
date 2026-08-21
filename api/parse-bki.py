@@ -143,6 +143,7 @@ def parse_pdf(pdf_path: str) -> dict:
                 "uid_unique": len({r["uid"] for r in contracts if r.get("uid")}),
                 "application_uid_nonempty": sum(1 for a in applications if a.get("uid")),
                 "summary_counts": parsed.get("summary_counts", {}),
+                "contract_qc": parsed.get("contract_qc", {}),
                 "sections_verified": ["contracts", "queries", "applications-first-pass"],
             },
             "diagnostics": {
