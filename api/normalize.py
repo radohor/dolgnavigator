@@ -154,9 +154,9 @@ def normalize_contract_state(
         return ContractState.CLOSED, None
 
     if acquirer_of_rights:
-        return ContractState.CLOSED, (
-            "нет явной даты закрытия, но указан приобретатель прав кредитора "
-            "(переуступка) -- договор закрыт по факту, дата закрытия не извлечена"
+        return ContractState.OTHER, (
+            "указан приобретатель прав кредитора; переуступка закрывает запись "
+            "прежнего кредитора, но не обязательство должника"
         )
 
     if termination_basis and not closure_dates:
