@@ -520,6 +520,14 @@ def parse_nbki(pdf_path: str) -> dict:
         1 for c in contracts if c.get("first_overdue_date_candidate")
     )
 
+    uid_counts = {}
+    for c in contracts:
+        uid = (c.get("uid") or "").strip().lower()
+        if uid:
+            uid_counts[uid] = uid_counts.get(uid, 0) + 1
+    duplicate_uid_groups = sum(1 for n in uid_counts.values() if n > 1)
+    duplicate_uid_rows = sum(n - 1 for n in uid_counts.values() if n > 1)
+
     return {
         "contracts": contracts,
         "applications": applications,
@@ -528,6 +536,8 @@ def parse_nbki(pdf_path: str) -> dict:
         "contract_qc": {
             "reported_zero_amounts": zero_amount_contracts,
             "overdue_date_candidates": overdue_candidates,
+            "duplicate_uid_groups": duplicate_uid_groups,
+            "duplicate_uid_rows": duplicate_uid_rows,
         },
         "warnings": warnings,
     }
