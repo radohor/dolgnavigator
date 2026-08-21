@@ -250,11 +250,12 @@ def parse_applications(text: str) -> list[Application]:
         participation = lines[i]
         next_anchor = anchors[k + 1] if k + 1 < len(anchors) else len(lines)
 
-        # назад: creditor lines, затем uid lines (guid-подобные, содержат "-"),
-        # затем дата обращения
+        # назад: creditor lines, затем uid lines, затем дата обращения.
+        # Название кредитора может занимать >6 строк, поэтому ищем
+        # ближайшую дату назад с защитным лимитом 40 строк.
         back = []
         b = i - 1
-        while b >= 0 and not DATE_RE.match(lines[b]) and len(back) < 6:
+        while b >= 0 and not DATE_RE.match(lines[b]) and len(back) < 40:
             back.append(lines[b])
             b -= 1
         back.reverse()
