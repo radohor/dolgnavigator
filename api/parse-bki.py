@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, sys, tempfile
+import json, os, sys, tempfile, hashlib, platform
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -9,9 +9,9 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import pymupdf
-from layout_utils import get_full_text
+from layout_utils import get_full_text, find_section
 from okb_adapter import parse_all_cards
-from scoring_adapter import parse_contracts_summary, parse_applications, parse_queries
+from scoring_adapter import parse_contracts_summary, parse_applications, parse_queries, VID_UCHASTIYA
 from scoring_uid_map import extract_scoring_uid_map
 
 MAX_FILE_BYTES = 4_300_000
@@ -79,8 +79,37 @@ def _application_status(status_raw):
             return s
     return None
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+def _scoring_application_diagnostics(text: str, applications: list) -> dict:
+    section = find_section(text, "Сведения об обращении субъекта", "Выданные кредиты / заключенные договоры поручительства", occurrence=-1)
+    lines = [l.strip() for l in section.split("\n") if l.strip()]
+    role_anchor_count = sum(1 for l in lines if l in VID_UCHASTIYA)
+    uid_nonempty = sum(1 for a in applications if getattr(a, "uid", None))
+    uid_empty = len(applications) - uid_nonempty
+    return {
+        "section_sha256": _sha256_text(section),
+        "section_chars": len(section),
+        "section_nonempty_lines": len(lines),
+        "role_anchor_count": role_anchor_count,
+        "applications_count": len(applications),
+        "applications_uid_nonempty": uid_nonempty,
+        "applications_uid_empty": uid_empty,
+        "python_version": platform.python_version(),
+        "pymupdf_version": getattr(pymupdf, "__version__", None),
+    }
+
 def parse_pdf(pdf_path: str) -> dict:
     bureau = detect_bureau(pdf_path)
+    file_sha256 = _sha256_file(pdf_path)
     doc = pymupdf.open(pdf_path)
     page_count = len(doc)
     doc.close()
@@ -98,6 +127,7 @@ def parse_pdf(pdf_path: str) -> dict:
                 "uid_unique": len({r["uid"] for r in contracts if r.get("uid")}),
                 "sections_verified": ["contracts"],
             },
+            "diagnostics": {"file_sha256": file_sha256, "python_version": platform.python_version(), "pymupdf_version": getattr(pymupdf, "__version__", None)},
             "warnings": ["В ОКБ этой версии верифицированы договоры; заявки и запросы ОКБ пока не включаются."]
         }
 
@@ -106,6 +136,7 @@ def parse_pdf(pdf_path: str) -> dict:
     ar = parse_applications(text)
     qr = parse_queries(text)
     uid_map = extract_scoring_uid_map(pdf_path)
+    app_diag = _scoring_application_diagnostics(text, ar)
 
     contracts = [{
         "index": c.index, "contract_id": c.contract_id, "uid": uid_map.get(c.contract_id),
@@ -147,6 +178,7 @@ def parse_pdf(pdf_path: str) -> dict:
             "application_uid_unique": len({a["uid"] for a in applications if a.get("uid")}),
             "sections_verified": ["contracts", "applications", "queries"],
         },
+        "diagnostics": {"file_sha256": file_sha256, **app_diag},
         "warnings": []
     }
 
