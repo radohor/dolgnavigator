@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v23 STABILIZATION: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ, Скоринг и НБКИ распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
+<div class="analyzer-note">v24 WORKING FINAL: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ, Скоринг и НБКИ распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -3413,13 +3413,14 @@ function creditRenderResult(docs){
     const cq=meta.contract_qc||{};
     const summaryTail=(summary.applications!=null||summary.queries!=null)?` · сводка БКИ: заявки ${summary.applications??'—'}, запросы ${summary.queries??'—'}`:'';
     const contractTail=(cq.reported_zero_amounts||cq.overdue_date_candidates||cq.duplicate_uid_rows)?` · договоры: нулевых лимитов ${cq.reported_zero_amounts??0}, кандидатов первой просрочки ${cq.overdue_date_candidates??0}, повторов одного УИД ${cq.duplicate_uid_rows??0}`:'';
-    const qcLine=`<div style="margin-top:3px;font-size:11px;color:#607077">УИД: ${meta.uid_unique??meta.contract_uid_map_count??'—'} · договоров ${dc.length} · заявок ${d.applications.length} · запросов ${d.queries.length}${summaryTail}${contractTail}</div>`;
+    const sourceContractCount=d.rawContractCount??dc.length;
+    const qcLine=`<div style="margin-top:3px;font-size:11px;color:#607077">УИД: ${meta.uid_unique??meta.contract_uid_map_count??'—'} · карточек договоров ${sourceContractCount} · заявок ${d.applications.length} · запросов ${d.queries.length}${summaryTail}${contractTail}</div>`;
     const diagLine=diag.file_sha256?`<div style="margin-top:3px;font-size:10px;color:#7b8790;word-break:break-all"><b>Диагностика:</b> PDF ${escapeHtml(diag.file_sha256.slice(0,16))}…${diag.section_sha256?' · section '+escapeHtml(diag.section_sha256.slice(0,16))+'… · anchors '+(diag.role_anchor_count??'—')+' · UID '+(diag.applications_uid_nonempty??'—')+'/'+(diag.applications_uid_empty??'—'):''} · PyMuPDF ${escapeHtml(diag.pymupdf_version||'—')} · Python ${escapeHtml(diag.python_version||'—')}</div>`:'';
     const qcWarn=(pc.warnings||[]).length?`<div style="margin-top:4px;font-size:12px;color:#8a5a00">${pc.warnings.map(w=>escapeHtml(w)).join(' · ')}</div>`:'';
     return `<div class="source-card">
       <div class="source-head"><div><h4>${escapeHtml(d.bureau)}</h4><span>${d.numPages} стр. · ${escapeHtml(d.name)}</span></div></div>
       <div class="source-metrics">
-        <div class="source-metric"><b>${dc.length}</b><span>договоров</span></div>
+        <div class="source-metric"><b>${d.rawContractCount??dc.length}</b><span>карточек договоров</span></div>
         <div class="source-metric"><b>${d.applications.length}</b><span>заявок</span></div>
         <div class="source-metric"><b>${rej}</b><span>отказов</span></div>
         <div class="source-metric"><b>${d.queries.length}</b><span>запросов</span></div>
@@ -3524,16 +3525,21 @@ function creditRenderResult(docs){
 
 
 function creditApiNormalizeDoc(data,file){
-  const contracts=(data.contracts||[]).map(c=>({
+  const rawContracts=(data.contracts||[]);
+  const contractSource=(Array.isArray(data.obligations)&&data.obligations.length)?data.obligations:rawContracts;
+  const contracts=contractSource.map(c=>({
     type:'Договор',
-    bank:creditNormBank(c.creditor||''),
-    source:c.creditor||'',
+    bank:creditNormBank(c.current_creditor||c.creditor||''),
+    source:c.current_creditor||c.creditor||'',
     date:creditDate(c.contract_date||c.start_date||c.obligation_start_date||''),
     amountNum:creditMoneyNumber(c.amount),
     amount:c.amount||'',
     uid:String(c.uid||'').trim().toLowerCase(),
     contract:c.contract_id||c.uid||'',
-    status:c.status_section||c.status||'',
+    status:c.obligation_state||c.state||c.status_section||c.status||'',
+    creditorHistory:c.creditor_history||[],
+    sameUidRows:c.same_uid_rows||1,
+    backendCanonical:!!(data.obligations&&data.obligations.length),
     product:c.product||(Array.isArray(c.creditor_type_raw)?c.creditor_type_raw.slice(-2).join(' '):''),
     // Verified deterministic fields from NBKI adapter.
     plannedEndDate:creditDate(c.planned_end_date||''),
@@ -3584,6 +3590,8 @@ function creditApiNormalizeDoc(data,file){
     numPages:data.page_count||0,
     bureau:data.bureau||'Не определено',
     contracts, applications, queries,
+    rawContractCount:(data.counts&&Number.isFinite(Number(data.counts.contracts)))?Number(data.counts.contracts):rawContracts.length,
+    backendObligationCount:(data.meta&&Number.isFinite(Number(data.meta.obligation_count)))?Number(data.meta.obligation_count):contracts.length,
     parserCore:{ok:true,counts:data.counts||{},meta:data.meta||{},diagnostics:data.diagnostics||{},warnings:data.warnings||[]}
   };
 }
