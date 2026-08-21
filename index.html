@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v22 NBKI: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ, Скоринг и НБКИ распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
+<div class="analyzer-note">v22.1 NBKI applications: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ, Скоринг и НБКИ распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -3433,7 +3433,7 @@ function creditRenderResult(docs){
 
     <div class="merge-card">
       <h3>После объединения БКИ</h3>
-      <p>Оба отчёта разбираются серверным Python-ядром без GPT. Договоры между БКИ объединяются детерминированно: сначала по точному УИД; мягкое сопоставление допускается только без конфликта УИД.</p>
+      <p>Загруженные отчёты разбираются серверным Python-ядром без GPT. Договоры между БКИ объединяются детерминированно: сначала по точному УИД; мягкое сопоставление допускается только без конфликта УИД.</p>
       <div class="merge-pills">
         <span class="merge-pill">Уникальных договоров: ${loans.length}</span>
         <span class="merge-pill">Подтверждены 2+ БКИ: ${confirmed2}</span>
