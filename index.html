@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v22.2 NBKI contracts: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ, Скоринг и НБКИ распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
+<div class="analyzer-note">v22.3 NBKI stabilization: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ, Скоринг и НБКИ распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -2965,7 +2965,10 @@ function creditDedupLoans(docs){
   const groups=[];
   const used=new Set();
 
-  // 1. Точные УИД. Это основной и самый надёжный путь.
+  // 1. Exact UID = one obligation.
+  // This applies both across different bureaux and inside one NBKI report.
+  // NBKI may show the same obligation twice after assignment of the creditor's
+  // rights: the assignee and the original lender keep the same UID.
   const uidMap=new Map();
   all.forEach((c,i)=>{
     const uid=String(c.uid||'').trim().toLowerCase();
@@ -2975,44 +2978,63 @@ function creditDedupLoans(docs){
   });
 
   for(const [uid,items] of uidMap){
+    if(items.length<2) continue;
+
+    // Canonical row for one obligation:
+    // use the earliest contract date as origination.
+    const ordered=[...items].sort((a,b)=>a.c.date-b.c.date);
+    const original=ordered[0];
+    const base={...original.c};
+
     const bureaus=[...new Set(items.map(x=>x.c.bureau))];
-    if(bureaus.length<2) continue;
-
-    // Не объединяем более одной записи одного и того же БКИ в одну группу.
-    const chosen=[];
-    const seenB=new Set();
-    for(const item of items){
-      if(seenB.has(item.c.bureau)) continue;
-      seenB.add(item.c.bureau);
-      chosen.push(item);
-    }
-    if(chosen.length<2) continue;
-
-    const base={...chosen[0].c};
-    base.sources=chosen.map(x=>x.c.bureau);
-    base.sourceCount=base.sources.length;
+    base.sources=bureaus;
+    base.sourceCount=bureaus.length;
     base.crossBkiMatches=[];
+    base.sameUidRows=items.length;
+    base.sameUidWithinBureau=items.some((x,ix)=>
+      items.some((y,jx)=>ix!==jx && x.c.bureau===y.c.bureau)
+    );
 
-    for(const item of chosen.slice(1)){
+    // Preserve creditor history. Do not replace an original zero/missing limit
+    // with an assignee's balance: those are different economic facts.
+    base.creditorHistory=ordered.map(x=>({
+      bureau:x.c.bureau,
+      bank:x.c.bank,
+      date:x.c.date,
+      amountNum:x.c.amountNum,
+      contract:x.c.contract||'',
+      status:x.c.status||''
+    }));
+
+    // Across different bureaux we keep the existing high-reliability audit.
+    for(const item of ordered.slice(1)){
       const c=item.c;
-      base.crossBkiMatches.push({
-        bureau:c.bureau,
-        bank:c.bank,
-        date:c.date,
-        amountNum:c.amountNum,
-        uid:c.uid||'',
-        contract:c.contract||'',
-        score:200,
-        reasons:['точный УИД'],
-        reliability:'высокая'
-      });
+      if(c.bureau!==base.bureau){
+        base.crossBkiMatches.push({
+          bureau:c.bureau,
+          bank:c.bank,
+          date:c.date,
+          amountNum:c.amountNum,
+          uid:c.uid||'',
+          contract:c.contract||'',
+          score:200,
+          reasons:['точный УИД'],
+          reliability:'высокая'
+        });
+      }
 
-      for(const f of ['contract','amountNum','amount','overdueDate','maxOverdueDays','paidTotal','actualEndDate','status','product','terminationBasis']){
+      // Enrich only fields that do not alter origination amount/date.
+      for(const f of [
+        'contract','overdueDate','maxOverdueDays','paidTotal','actualEndDate',
+        'status','product','terminationBasis','plannedEndDate','statusDate',
+        'currentDebt','currentOverdueAmount','historicalMaxDebt',
+        'overdueDateCandidate','overdueDateCandidateConfidence'
+      ]){
         if((base[f]==null||base[f]==='') && c[f]!=null && c[f]!=='') base[f]=c[f];
       }
       used.add(item.i);
     }
-    used.add(chosen[0].i);
+    used.add(original.i);
     groups.push(base);
   }
 
@@ -3347,6 +3369,16 @@ function creditRenderResult(docs){
       return details;
     }).join('');
 
+  const sameUidWithinBki=loans.filter(l=>l.sameUidWithinBureau);
+  const sameUidWithinBkiHtml=sameUidWithinBki.length?`
+    <div class="quality-warn">
+      <b>Объединение внутри одного БКИ:</b><br>
+      ${sameUidWithinBki.map(l=>{
+        const hist=(l.creditorHistory||[]).map(h=>`${escapeHtml(h.bank)} · ${creditFmt(h.date)}`).join(' → ');
+        return `Один УИД представлен несколькими карточками кредитора и учтён как одно обязательство: ${hist}`;
+      }).join('<br>')}
+    </div>`:'';
+
   const parserWarnings=docs.flatMap(d=>(d.parserCore?.warnings||[]).map(w=>`${d.bureau}: ${w}`));
   const aiQualityGateHtml=parserWarnings.length?`<div class="quality-warn"><b>Ограничение текущей версии:</b><br>${parserWarnings.map(escapeHtml).join('<br>')}</div>`:'';
 
@@ -3374,7 +3406,7 @@ function creditRenderResult(docs){
     const summary=meta.summary_counts||{};
     const cq=meta.contract_qc||{};
     const summaryTail=(summary.applications!=null||summary.queries!=null)?` · сводка БКИ: заявки ${summary.applications??'—'}, запросы ${summary.queries??'—'}`:'';
-    const contractTail=(cq.reported_zero_amounts||cq.overdue_date_candidates)?` · договоры: нулевых лимитов ${cq.reported_zero_amounts??0}, кандидатов первой просрочки ${cq.overdue_date_candidates??0}`:'';
+    const contractTail=(cq.reported_zero_amounts||cq.overdue_date_candidates||cq.duplicate_uid_rows)?` · договоры: нулевых лимитов ${cq.reported_zero_amounts??0}, кандидатов первой просрочки ${cq.overdue_date_candidates??0}, повторов одного УИД ${cq.duplicate_uid_rows??0}`:'';
     const qcLine=`<div style="margin-top:3px;font-size:11px;color:#607077">УИД: ${meta.uid_unique??meta.contract_uid_map_count??'—'} · договоров ${dc.length} · заявок ${d.applications.length} · запросов ${d.queries.length}${summaryTail}${contractTail}</div>`;
     const diagLine=diag.file_sha256?`<div style="margin-top:3px;font-size:10px;color:#7b8790;word-break:break-all"><b>Диагностика:</b> PDF ${escapeHtml(diag.file_sha256.slice(0,16))}…${diag.section_sha256?' · section '+escapeHtml(diag.section_sha256.slice(0,16))+'… · anchors '+(diag.role_anchor_count??'—')+' · UID '+(diag.applications_uid_nonempty??'—')+'/'+(diag.applications_uid_empty??'—'):''} · PyMuPDF ${escapeHtml(diag.pymupdf_version||'—')} · Python ${escapeHtml(diag.python_version||'—')}</div>`:'';
     const qcWarn=(pc.warnings||[]).length?`<div style="margin-top:4px;font-size:12px;color:#8a5a00">${pc.warnings.map(w=>escapeHtml(w)).join(' · ')}</div>`:'';
@@ -3474,7 +3506,7 @@ function creditRenderResult(docs){
       </div>
     </div>
 
-    <div class="cta15"><div>${aiQualityGateHtml}<h3>Следующий этап — юридический анализ</h3><p>Парсер БКИ отделён от юридического AI. На следующем этапе к структурированным данным подключаются анкеты, доход, обстоятельства прекращения платежей, имущество и сделки.</p></div><button class="btn primary" type="button" onclick="startFlow('full')">Продолжить проверку</button></div>
+    <div class="cta15"><div>${sameUidWithinBkiHtml}${aiQualityGateHtml}<h3>Следующий этап — юридический анализ</h3><p>Парсер БКИ отделён от юридического AI. На следующем этапе к структурированным данным подключаются анкеты, доход, обстоятельства прекращения платежей, имущество и сделки.</p></div><button class="btn primary" type="button" onclick="startFlow('full')">Продолжить проверку</button></div>
   `;
 
   document.getElementById('creditTechToggle')?.addEventListener('click',()=>{
@@ -3497,9 +3529,21 @@ function creditApiNormalizeDoc(data,file){
     contract:c.contract_id||c.uid||'',
     status:c.status_section||c.status||'',
     product:c.product||(Array.isArray(c.creditor_type_raw)?c.creditor_type_raw.slice(-2).join(' '):''),
+    // Verified deterministic fields from NBKI adapter.
+    plannedEndDate:creditDate(c.planned_end_date||''),
+    actualEndDate:creditDate(c.actual_end_date||''),
+    statusDate:creditDate(c.status_date||''),
+    terminationBasis:c.termination_basis||'',
+    currentDebt:creditMoneyNumber(c.current_debt),
+    currentOverdueAmount:creditMoneyNumber(c.current_overdue_amount),
+    historicalMaxDebt:creditMoneyNumber(c.historical_max_debt),
+    amountQuality:c.amount_quality||'',
+    overdueDateCandidate:creditDate(c.first_overdue_date_candidate||''),
+    overdueDateCandidateConfidence:c.first_overdue_date_candidate_confidence||'',
+    // IMPORTANT: candidate is not promoted to overdueDate yet.
     overdueDate:null,
     paidTotal:null,
-    bureauType:'python-v21'
+    bureauType:'python-v22.3'
   })).filter(c=>c.date);
 
   const applications=(data.applications||[]).map(a=>({
