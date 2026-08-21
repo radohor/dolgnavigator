@@ -829,7 +829,7 @@ window.addEventListener('DOMContentLoaded', function(){
 <div class="file-list" id="creditFileList"></div>
 <div class="analysis-progress" id="creditProgress"><div id="creditProgressBar"></div></div>
 <button class="btn primary" id="creditAnalyzeBtn" style="width:100%;margin-top:12px;display:none" type="button">Начать анализ</button>
-<div class="analyzer-note">v21.1 stable counts: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ и Скоринг распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
+<div class="analyzer-note">v21.2 diagnostics: БКИ разбираются серверным Python-ядром (PyMuPDF + pdfplumber). GPT не участвует в извлечении договоров, заявок и запросов. ОКБ и Скоринг распознаются отдельными адаптерами; договоры объединяются по точному УИД. Заявки и запросы больше не схлопываются по совпадению даты/кредитора.</div>
 </div>
 <div class="credit-results" id="creditResults"></div>
 </section>
@@ -3370,7 +3370,9 @@ function creditRenderResult(docs){
     const meta=pc.meta||{};
     const verified=(meta.sections_verified||[]).join(', ');
     const aiLine=`<div style="margin-top:8px;font-size:12px;color:#607077"><b>Python parser:</b> OK${verified?' · проверено: '+escapeHtml(verified):''}</div>`;
+    const diag=pc.diagnostics||{};
     const qcLine=`<div style="margin-top:3px;font-size:11px;color:#607077">УИД: ${meta.uid_unique??meta.contract_uid_map_count??'—'} · договоров ${dc.length} · заявок ${d.applications.length} · запросов ${d.queries.length}</div>`;
+    const diagLine=diag.file_sha256?`<div style="margin-top:3px;font-size:10px;color:#7b8790;word-break:break-all"><b>Диагностика:</b> PDF ${escapeHtml(diag.file_sha256.slice(0,16))}…${diag.section_sha256?' · section '+escapeHtml(diag.section_sha256.slice(0,16))+'… · anchors '+(diag.role_anchor_count??'—')+' · UID '+(diag.applications_uid_nonempty??'—')+'/'+(diag.applications_uid_empty??'—'):''} · PyMuPDF ${escapeHtml(diag.pymupdf_version||'—')} · Python ${escapeHtml(diag.python_version||'—')}</div>`:'';
     const qcWarn=(pc.warnings||[]).length?`<div style="margin-top:4px;font-size:12px;color:#8a5a00">${pc.warnings.map(w=>escapeHtml(w)).join(' · ')}</div>`:'';
     return `<div class="source-card">
       <div class="source-head"><div><h4>${escapeHtml(d.bureau)}</h4><span>${d.numPages} стр. · ${escapeHtml(d.name)}</span></div></div>
@@ -3382,6 +3384,7 @@ function creditRenderResult(docs){
       </div>
       ${aiLine}
       ${qcLine}
+      ${diagLine}
       ${qcWarn}
     </div>`;
   }).join('');
@@ -3439,7 +3442,7 @@ function creditRenderResult(docs){
       </div>
     </div>
 
-    ${docs.some(d=>d.queries.length===0)?`<div class="quality-warn"><b>Контроль качества:</b> по одному или нескольким отчётам запросы БКИ пока не извлечены. Поэтому нулевое значение по конкретному бюро не трактуется как отсутствие реальных запросов.</div>`:''}
+    ${docs.some(d=>d.queries.length===0)?`<div class="quality-warn"><b>Контроль качества:</b> по ОКБ в этой версии пока не верифицированы заявки и запросы. Нулевые значения по этим двум разделам ОКБ не означают, что таких записей нет в исходном отчёте.</div>`:''}
 
     <div class="crisis-card">
       <div class="eyebrow">Ориентир финансового кризиса</div>
@@ -3527,7 +3530,7 @@ function creditApiNormalizeDoc(data,file){
     numPages:data.page_count||0,
     bureau:data.bureau||'Не определено',
     contracts, applications, queries,
-    parserCore:{ok:true,counts:data.counts||{},meta:data.meta||{},warnings:data.warnings||[]}
+    parserCore:{ok:true,counts:data.counts||{},meta:data.meta||{},diagnostics:data.diagnostics||{},warnings:data.warnings||[]}
   };
 }
 
