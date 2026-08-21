@@ -14,28 +14,22 @@ from okb_adapter import parse_all_cards
 from scoring_adapter import parse_contracts_summary, parse_applications, parse_queries, VID_UCHASTIYA
 from scoring_uid_map import extract_scoring_uid_map
 from nbki_adapter import parse_nbki
+from detect import detect as _detect_format
 
 MAX_FILE_BYTES = 4_300_000
 
-def _probe_text(pdf_path: str, pages: int = 12) -> str:
-    doc = pymupdf.open(pdf_path)
-    return "\n".join(doc[i].get_text() for i in range(min(pages, len(doc))))
-
 def detect_bureau(pdf_path: str) -> str:
-    probe = _probe_text(pdf_path).upper()
+    """
+    Тонкая обёртка над реестром detect.py -- сохраняет старую сигнатуру
+    (возвращает только код бюро), которую использует остальной код этого
+    файла. format_version пока не потребляется здесь (адаптеры одни на
+    бюро), но уже вычисляется и логируется -- это точка, куда воткнётся
+    выбор адаптера по (bureau, format_version), когда появится
+    scoring_current_adapter и т.п., без переписывания этой функции.
+    """
+    match = _detect_format(pdf_path)
+    return match.bureau
 
-    if ("КРЕДИТНЫЙ ОТЧЕТ ДЛЯ СУБЪЕКТА" in probe
-        and ("ОБРАЩАЙТЕСЬ В НБКИ" in probe or "SYSTEM VERSION:" in probe)):
-        return "nbki"
-
-    if "СВОДНАЯ ИНФОРМАЦИЯ ПО ДОГОВОРАМ ЗАЙМА" in probe:
-        return "scoring"
-    if ("КРЕДИСТОРИЯ" in probe or "ОБЪЕДИНЕННОГО КРЕДИТНОГО БЮРО" in probe
-        or 'АО «ОКБ»' in probe or 'АО "ОКБ"' in probe):
-        return "okb"
-    if "ПОДРОБНАЯ ИНФОРМАЦИЯ ПО ДОГОВОРАМ" in probe and "КОД ОТЧЕТА" in probe:
-        return "scoring"
-    raise ValueError("Формат БКИ не распознан. Поддерживаются НБКИ, ОКБ/Кредистория и Скоринг Бюро.")
 
 def _clean_join(parts) -> str:
     if not parts:
@@ -241,15 +235,41 @@ class handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
-                raise ValueError("PDF-файл пуст.")
-            if length > MAX_FILE_BYTES:
-                raise ValueError("PDF больше 4,3 МБ. Для такого файла понадобится отдельная схема загрузки.")
-            data = self.rfile.read(length)
-            if not data.startswith(b"%PDF"):
-                raise ValueError("Ожидается PDF-файл.")
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(data)
-                tmp_path = tmp.name
+                raise ValueError("Пустое тело запроса.")
+
+            content_type = self.headers.get("Content-Type", "")
+
+            if "application/json" in content_type:
+                # Крупные файлы: тело -- это {"telegram_file_id": "..."},
+                # сам PDF никогда не проходит через тело этого запроса,
+                # поэтому лимит MAX_FILE_BYTES здесь не применяется.
+                raw_body = self.rfile.read(length)
+                try:
+                    payload = json.loads(raw_body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    raise ValueError("Некорректный JSON в теле запроса.")
+                file_id = payload.get("telegram_file_id")
+                if not file_id:
+                    raise ValueError("Ожидается поле telegram_file_id в JSON-теле.")
+                from telegram_fetch import fetch_pdf_by_telegram_file_id, TelegramFetchError
+                try:
+                    tmp_path = fetch_pdf_by_telegram_file_id(file_id)
+                except TelegramFetchError as e:
+                    raise ValueError(str(e))
+            else:
+                if length > MAX_FILE_BYTES:
+                    raise ValueError(
+                        "PDF больше 4,3 МБ. Пришлите вместо файла JSON вида "
+                        '{"telegram_file_id": "..."} -- функция скачает файл '
+                        "сама через Telegram Bot API (до 20 МБ)."
+                    )
+                data = self.rfile.read(length)
+                if not data.startswith(b"%PDF"):
+                    raise ValueError("Ожидается PDF-файл.")
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+
             result = parse_pdf(tmp_path)
             result["filename"] = self.headers.get("X-Filename", "upload.pdf")
             self._json(200, result)

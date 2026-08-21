@@ -7,6 +7,8 @@ from typing import Optional
 
 import pymupdf
 
+from normalize import normalize_application_status, normalize_contract_state
+
 DATE_RE = re.compile(r"\b(\d{2}-\d{2}-\d{4})\b")
 GUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9a-f])", re.I)
 CONTRACT_HEAD_RE = re.compile(r"(?m)^\s*(\d+)\.\s+(.+?)\s*$")
@@ -273,6 +275,12 @@ def parse_contracts(text: str) -> list[dict]:
         status_date = _field(chunk, "Дата статуса:")
         current_debt = _field(chunk, "Задолж-сть:")
         overdue = _field(chunk, "Просрочено:")
+        # "Третий вариант" карточки (см. /areas/dolgnavigator.md): реальная
+        # дата закрытия здесь лежит в ЭТОМ поле, а не в "Открыт"/"Статус".
+        # Раньше не извлекалось вообще -- договор молча считался открытым
+        # (найдено на реальном отчёте Солтаевой: 4-й договор,
+        # АО "Россельхозбанк", "Потребит.кредит").
+        fact_full_execution = _field(chunk, "Факт.исполн.в полн.объеме:")
         planned_end = None
         actual_end = None
         termination_basis = None
@@ -303,6 +311,13 @@ def parse_contracts(text: str) -> list[dict]:
                 if mm:
                     overdue = _clean(mm.group(1))
 
+        contract_state, state_warning = normalize_contract_state(
+            actual_end_date=actual_end,
+            status_text=status,
+            fact_full_execution_date=fact_full_execution,
+            termination_basis=termination_basis,
+        )
+
         reported_amount_num = _money_number(amount)
         amount_quality = "reported"
         if reported_amount_num == 0:
@@ -323,9 +338,12 @@ def parse_contracts(text: str) -> list[dict]:
             "start_date": start_date,
             "planned_end_date": planned_end,
             "actual_end_date": actual_end,
+            "fact_full_execution_date": fact_full_execution,
             "status": status,
             "status_date": status_date,
             "termination_basis": termination_basis,
+            "state": contract_state.value,
+            "state_warning": state_warning,
             "current_debt": current_debt,
             "current_overdue_amount": overdue,
             "historical_max_debt": _format_money_rub(historical_max),
@@ -367,10 +385,21 @@ def _modern_application_blocks(text: str) -> list[dict]:
         uid = _first_guid_after(block, r"УИ[Дд]\s+обращения:\s*")
         app_date = _field(block, "Дата обращения:")
         amount = _field(block, "Запрошенная сумма:")
-        status = _field(block, "Стадия рассмотрения обращения:")
+        raw_status = _field(block, "Стадия рассмотрения обращения:")
         refusal_date = _field(block, "Дата отказа:")
         method = _field(block, "Способ обращения:")
         reason = _field(block, "Код причины отказа:")
+        approved_amount = _field(block, "Одобренная сумма:")
+
+        # НЕ берём raw_status напрямую: в современных карточках стадия
+        # может быть "Н/Д" одновременно с заполненными датой/причиной
+        # отказа -- сама стадия недостоверна, факты рядом достоверны.
+        # См. normalize.py -- эта же функция используется для legacy-блока
+        # ниже и для будущих форматов, чтобы не чинить это точечно каждый раз.
+        status, status_warning = normalize_application_status(
+            raw_stage=raw_status, refusal_date=refusal_date, refusal_reason=reason,
+            approval_decision=approved_amount,
+        )
 
         creditor = _multiline_field(
             block,
@@ -385,7 +414,9 @@ def _modern_application_blocks(text: str) -> list[dict]:
             "uid": uid,
             "creditor": creditor,
             "amount": amount,
-            "status": status,
+            "status": status.value,
+            "status_raw": raw_status,
+            "status_warning": status_warning,
             "refusal_date": refusal_date,
             "method": method,
             "refusal_reason": reason,
@@ -419,11 +450,11 @@ def _legacy_application_blocks(text: str) -> list[dict]:
             ("Гос.рег.номер:", "ИНН:", "Заявка", "Код запроса"),
             max_lines=8
         )
-        status = None
-        if decision and decision != "Н/Д":
-            status = decision
-        elif refusal_date and refusal_date != "Н/Д":
-            status = "Отказ"
+        status_obj, status_warning = normalize_application_status(
+            raw_stage=None, refusal_date=refusal_date if refusal_date != "Н/Д" else None,
+            approval_decision=decision if decision and decision != "Н/Д" else None,
+        )
+        status = status_obj.value if (decision or refusal_date) else None
         out.append({
             "application_date": date,
             "uid": None,
@@ -431,6 +462,7 @@ def _legacy_application_blocks(text: str) -> list[dict]:
             "creditor": creditor,
             "amount": amount,
             "status": status,
+            "status_warning": status_warning,
             "refusal_date": refusal_date,
             "method": method,
             "format": "legacy",
@@ -541,3 +573,35 @@ def parse_nbki(pdf_path: str) -> dict:
         },
         "warnings": warnings,
     }
+
+
+def open_contract_count(contracts: list[dict]) -> int:
+    """
+    Число ОТКРЫТЫХ обязательств после дедупликации по УИД -- не по сырым
+    карточкам. Один УИД может встречаться несколько раз (переуступка,
+    старый+новый формат одного кредита) -- это одно обязательство, и его
+    состояние определяется по канонической записи (закрытой, если хоть
+    одна запись в цепочке закрыта; иначе -- первой доступной).
+
+    Найдено на реальном отчёте Натальи: карточка первоначального
+    кредитора (АО "ТБАНК") после полной переуступки долга не содержит
+    СВОИХ сигналов закрытия вообще -- переуступка отражена только на
+    стороне принявшего долг (ООО "ПКО "Феникс"). Подсчёт по сырым
+    карточкам давал 1 открытый вместо 0 по сводке НБКИ; после дедупа
+    по УИД -- 0, как и должно быть.
+    """
+    by_uid: dict[str, list[dict]] = {}
+    no_uid: list[dict] = []
+    for c in contracts:
+        if c.get("uid"):
+            by_uid.setdefault(c["uid"], []).append(c)
+        else:
+            no_uid.append(c)
+
+    open_count = 0
+    for group in by_uid.values():
+        canonical = next((c for c in group if c.get("state") == "Закрыт"), group[0])
+        if canonical.get("state") == "Открыт":
+            open_count += 1
+    open_count += sum(1 for c in no_uid if c.get("state") == "Открыт")
+    return open_count
