@@ -157,28 +157,43 @@ def parse_contracts(text: str) -> list[dict]:
 
 
 def _modern_application_blocks(text: str) -> list[dict]:
-    # New NBKI format has a unique UID for each application.
+    """
+    New NBKI format.
+
+    Important: in NBKI the application date and creditor are located AFTER the
+    application UID, while requested amount / participation are located BEFORE it.
+    Therefore a symmetric window around UID is unsafe: it can pick fields from the
+    next application. We first isolate one complete application block from the
+    nearest preceding "Вид участия:" to the next "Вид участия:".
+    """
     matches = list(re.finditer(r"УИ[Дд]\s+обращения:\s*", text, re.I))
     out = []
-    for i, m in enumerate(matches):
-        # Bounded neighborhood; fields can straddle pages.
-        left = max(0, m.start() - 1800)
-        right = min(len(text), m.start() + 5000)
+
+    for m in matches:
+        # Start of the current application.
+        left = text.rfind("\nВид участия:", max(0, m.start() - 4000), m.start())
+        if left < 0:
+            left = max(0, m.start() - 2500)
+        else:
+            left += 1
+
+        # Start of the next application.
+        right = text.find("\nВид участия:", m.end())
+        if right < 0 or right - m.start() > 9000:
+            right = min(len(text), m.start() + 7000)
+
         block = text[left:right]
 
-        uid = _first_guid_after(text[m.start():m.start()+600], r"УИ[Дд]\s+обращения:\s*")
-        # nearest preceding application date inside neighborhood
-        prev = list(re.finditer(r"Дата обращения:\s*(\d{2}-\d{2}-\d{4})", block[:m.start()-left], re.I))
-        app_date = prev[-1].group(1) if prev else None
-
-        amount = _field(block[m.start()-left:], "Запрошенная сумма:")
-        status = _field(block[m.start()-left:], "Стадия рассмотрения обращения:")
-        refusal_date = _field(block[m.start()-left:], "Дата отказа:")
-        method = _field(block[m.start()-left:], "Способ обращения:")
-        reason = _field(block[m.start()-left:], "Код причины отказа:")
+        uid = _first_guid_after(block, r"УИ[Дд]\s+обращения:\s*")
+        app_date = _field(block, "Дата обращения:")
+        amount = _field(block, "Запрошенная сумма:")
+        status = _field(block, "Стадия рассмотрения обращения:")
+        refusal_date = _field(block, "Дата отказа:")
+        method = _field(block, "Способ обращения:")
+        reason = _field(block, "Код причины отказа:")
 
         creditor = _multiline_field(
-            block[m.start()-left:],
+            block,
             "Полное наименование:",
             ("Сокращенное наименование:", "Иное наименование:", "Идентификатор LEI:",
              "Дата создания:", "Гос.рег.номер:", "Регистрационный номер:"),
@@ -197,7 +212,6 @@ def _modern_application_blocks(text: str) -> list[dict]:
             "format": "modern",
         })
     return out
-
 
 def _legacy_application_blocks(text: str) -> list[dict]:
     # Old NBKI format: "Заявка" + number/date, no application UID.
